@@ -1,0 +1,5 @@
+from .mot_challenge_2d_box import MotChallenge2DBox
+
+__all__ = [
+    "MotChallenge2DBox",
+]

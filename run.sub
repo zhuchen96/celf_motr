@@ -1,0 +1,59 @@
+######################################################################
+# Necessary parameters
+######################################################################
+
+cmd = /work/scratch/mededovic/selfmotr/SelfMOTR_Pilot/configs/SportsMOT/train.sh
+args =
+initialdir = /work/scratch/mededovic/selfmotr/SelfMOTR_Pilot
+
+######################################################################
+# Resource requests
+######################################################################
+
+# CPUs (increase as needed)
+request_cpus = 4
+
+# GPUs
+request_gpus = 4
+
+# Host (CPU) RAM
+request_memory = 25 GB
+
+# Disk
+request_disk = 20 GB
+
+######################################################################
+# Requirements (GPU VRAM)
+######################################################################
+
+# Require at least 50,000 MB GPU VRAM (50 GB)
+requirements = (GPUs_GlobalMemoryMb >= 21000 && TARGET.Machine=="radon.lfb.rwth-aachen.de")
+
+######################################################################
+# Further preferences
+######################################################################
+
+getenv       = True
+stream_error = true
+stream_output = true
+should_transfer_files = IF_NEEDED
+
+run_as_owner = True
+load_profile = True
+
+######################################################################
+# Logs
+######################################################################
+EXP = SportsMOTE2ETracking
++Experiment = "$(EXP)"
+
+LOG_DIR = /work/scratch/$ENV(USER)/selfmotr/SelfMOTR_Pilot/condor
+error  = $(LOG_DIR)/$(EXP)_$(cluster).$(Process)_err.log
+output = $(LOG_DIR)/$(EXP)_$(cluster).$(Process)_out.log
+log    = $(LOG_DIR)/$(EXP)_$(cluster).$(Process)_log.log
+
+######################################################################
+# Queue
+######################################################################
+
+queue 1

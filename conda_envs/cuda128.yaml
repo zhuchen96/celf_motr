@@ -1,0 +1,13 @@
+name: cuda128
+channels:
+  - nvidia
+  - conda-forge
+dependencies:
+  - cuda-toolkit=12.8
+  - cudnn
+  - nccl
+  - cutensor
+  - cusparselt
+  - libcublas
+  - libcudss
+  - cuda-thrust

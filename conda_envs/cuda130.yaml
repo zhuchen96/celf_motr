@@ -1,0 +1,13 @@
+name: cuda130
+channels:
+  - nvidia
+  - conda-forge
+dependencies:
+  - cuda-toolkit=13.0
+  - cudnn
+  - nccl
+  - cutensor
+  - cusparselt
+  - libcublas
+  - libcudss
+  - cuda-thrust
