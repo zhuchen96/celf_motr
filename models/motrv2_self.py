@@ -287,6 +287,29 @@ class ClipMatcher(SetCriterion):
                 self.losses_dict.update(
                     {'frame_{}_ps{}_{}'.format(self._current_frame_idx, i, key): value for key, value in
                         l_dict.items()})
+
+        # ------------------------------------------------------------------
+        # Division-ahead loss
+        # Supervised on every matched track: predict (logit) whether the GT
+        # cell this track is assigned to is at its last frame before dividing.
+        # Only computed when gt_instances carry div_flags (cell dataset).
+        # ------------------------------------------------------------------
+        if gt_instances_i.has('div_flags') and track_instances.has('pred_div_ahead'):
+            # Keep only matched pairs where GT index is valid (not -1 / FP).
+            # Always write the key so reduce_dict sees identical keys on all ranks.
+            valid_mask = matched_indices[:, 1] >= 0
+            if valid_mask.sum() > 0:
+                src_idx = matched_indices[valid_mask, 0]
+                tgt_idx = matched_indices[valid_mask, 1]
+                pred_div = track_instances.pred_div_ahead[src_idx]          # [N]
+                gt_div   = gt_instances_i.div_flags[tgt_idx].to(pred_div)  # [N]
+                loss_div = F.binary_cross_entropy_with_logits(pred_div, gt_div)
+            else:
+                loss_div = track_instances.pred_div_ahead.sum() * 0.0  # zero, keeps grad graph
+            self.losses_dict[
+                'frame_{}_loss_div_ahead'.format(self._current_frame_idx)
+            ] = loss_div
+
         self._step()
         return track_instances
 
@@ -459,6 +482,13 @@ class MOTR(nn.Module):
             self.transformer.decoder.class_embed = self.class_embed
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
+        # Division-ahead prediction head: hidden_dim → 1 logit per query.
+        # Predicts whether a tracked cell is at its last frame before dividing.
+        # Initialised to zero so it starts as a no-op and is learned from data.
+        self.div_ahead_embed = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.div_ahead_embed.weight)
+        nn.init.zeros_(self.div_ahead_embed.bias)
+
         self.post_process = TrackerPostProcess()
         self.track_base = RuntimeTrackerBase()
         self.criterion = criterion
@@ -489,6 +519,8 @@ class MOTR(nn.Module):
         track_instances.mem_bank = torch.zeros((len(track_instances), mem_bank_len, d_model), dtype=torch.float32, device=device)
         track_instances.mem_padding_mask = torch.ones((len(track_instances), mem_bank_len), dtype=torch.bool, device=device)
         track_instances.save_period = torch.zeros((len(track_instances), ), dtype=torch.float32, device=device)
+        # Division-ahead logits: raw (pre-sigmoid) score per query.
+        track_instances.pred_div_ahead = torch.zeros((len(track_instances),), dtype=torch.float32, device=device)
 
         return track_instances.to(self.query_embed.weight.device)
 
@@ -571,6 +603,8 @@ class MOTR(nn.Module):
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         out['hs'] = hs[-1]
+        # pred_div_ahead: raw logit per query, shape [batch, num_queries]
+        out['pred_div_ahead'] = self.div_ahead_embed(hs[-1]).squeeze(-1)
         return out
 
     def _forward_single_image_detector(self, samples, track_instances: Instances):
@@ -890,6 +924,8 @@ class MOTR(nn.Module):
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         out['hs'] = hs[-1]
+        # pred_div_ahead: raw logit per query, shape [batch, num_queries]
+        out['pred_div_ahead'] = self.div_ahead_embed(hs[-1]).squeeze(-1)
         return out
 
     def _post_process_single_image(self, frame_res, track_instances, is_last):
@@ -900,6 +936,8 @@ class MOTR(nn.Module):
             frame_res['hs'] = frame_res['hs'][:, :n_ins]
             frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
             frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
+            if 'pred_div_ahead' in frame_res:
+                frame_res['pred_div_ahead'] = frame_res['pred_div_ahead'][:, :n_ins]
             ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
             for aux_outputs in frame_res['aux_outputs']:
                 ps_outputs.append({
@@ -920,6 +958,8 @@ class MOTR(nn.Module):
         track_instances.pred_logits = frame_res['pred_logits'][0]
         track_instances.pred_boxes = frame_res['pred_boxes'][0]
         track_instances.output_embedding = frame_res['hs'][0]
+        if 'pred_div_ahead' in frame_res:
+            track_instances.pred_div_ahead = frame_res['pred_div_ahead'][0]
         if self.training:
             # the track id will be assigned by the mather.
             frame_res['track_instances'] = track_instances
@@ -1350,8 +1390,9 @@ def build(args):
         'e2e_bft': 1,
         'e2e_wat': 1,
         'e2e_sportsmot_v2': 1,
+        'e2e_cell': 1,
     }
-    
+
     assert args.dataset_file in dataset_to_num_classes
     num_classes = dataset_to_num_classes[args.dataset_file]
     device = torch.device(args.device)
@@ -1365,12 +1406,15 @@ def build(args):
 
     img_matcher = build_matcher(args)
     num_frames_per_batch = max(args.sampler_lengths)
+    div_loss_coef = getattr(args, 'div_loss_coef', 0.0)
     weight_dict = {}
     for i in range(num_frames_per_batch):
         weight_dict.update({"frame_{}_loss_ce".format(i): args.cls_loss_coef,
                             'frame_{}_loss_bbox'.format(i): args.bbox_loss_coef,
                             'frame_{}_loss_giou'.format(i): args.giou_loss_coef,
                             })
+        if div_loss_coef > 0:
+            weight_dict["frame_{}_loss_div_ahead".format(i)] = div_loss_coef
 
     # TODO this is a hack
     if args.aux_loss:

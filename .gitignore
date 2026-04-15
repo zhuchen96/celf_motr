@@ -39,3 +39,4 @@ htmlcov/
 .env
 .env.*
 *.log
+outputs/

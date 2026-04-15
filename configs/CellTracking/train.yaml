@@ -1,0 +1,107 @@
+# ============================================================
+# SelfMOTR — Cell Tracking — Training config
+# ============================================================
+# Data
+# ----
+# Point mot_path at the Cell-TRACTR COCO root:
+#   annotations/{train,val}/anno.json
+#   {train,val}/img/CTC_<seq>_frame_<t>.tif
+#   man_track/{train,val}/<seq>.txt   (optional; enables div loss)
+# ============================================================
+
+# --- paths ---
+mot_path: /srv/home/chen/Cell-TRACTR/data/moma/COCO
+output_dir: /srv/home/chen/cell_motr/self/outputs/cell_moma
+pretrained: /srv/home/chen/self/ckpt/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth
+
+# --- dataset ---
+dataset_file: e2e_cell
+meta_arch: motrv2_self
+
+# --- model ---
+backbone: resnet50
+num_feature_levels: 4
+enc_layers: 6
+dec_layers: 6
+dim_feedforward: 1024
+hidden_dim: 256
+nheads: 8
+dec_n_points: 4
+enc_n_points: 4
+num_anchors: 1
+with_box_refine: true
+two_stage: false
+shared_decoder: true
+
+# --- queries ---
+# num_queries: max simultaneous tracks ≈ max cells/frame
+#   moma: max 17 cells/frame → 20 is enough
+# num_queries_detect: detection proposals fed to the tracker
+num_queries: 20
+num_queries_detect: 100
+
+# --- query interaction ---
+query_interaction_layer: QIMv2
+random_drop: 0.1
+fp_ratio: 0.1
+merger_dropout: 0.0
+dropout: 0.0
+
+# --- sampling / curriculum ---
+# Start with sampler_lengths: [2] for quick testing.
+# Increase to [2, 3, 4] with sampler_steps: [5, 10] for full training.
+sample_mode: random_interval
+sample_interval: 5
+sampler_lengths: [2, 3, 4]
+sampler_steps: [5, 10]
+
+# --- optimiser ---
+lr: 2.0e-4
+lr_backbone: 2.0e-5
+lr_backbone_names: ["backbone.0"]
+lr_linear_proj_names: ["reference_points", "sampling_offsets"]
+lr_linear_proj_mult: 0.1
+weight_decay: 1.0e-4
+clip_max_norm: 0.1
+sgd: false
+
+# --- schedule ---
+epochs: 30
+lr_drop: 20
+save_period: 5
+
+# --- loss weights ---
+cls_loss_coef: 2.0
+bbox_loss_coef: 5.0
+giou_loss_coef: 2.0
+set_cost_class: 2.0
+set_cost_bbox: 5.0
+set_cost_giou: 2.0
+focal_alpha: 0.25
+aux_loss: true
+
+# --- division prediction ---
+# Requires man_track/<split>/<seq>.txt files at mot_path.
+# Set to 0.0 to disable if man_track is not available.
+div_loss_coef: 1.0
+
+# --- self-proposal ---
+score_threshold: 0.05
+lambda_detect: 0.5
+query_denoise: 0.05
+
+# --- training utilities ---
+batch_size: 1
+accum_iter: 1      # effective batch = batch_size * accum_iter * num_gpus
+num_workers: 2
+reuse_encoder_cache: true
+device: cuda
+seed: 42
+use_checkpoint: false   # gradient checkpointing (saves VRAM, slower)
+
+# --- unused / keep defaults ---
+masks: false
+memory_bank_type: ~
+memory_bank_score_thresh: 0.0
+memory_bank_len: 4
+memory_bank_with_self_attn: false
