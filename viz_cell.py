@@ -323,7 +323,7 @@ if __name__ == '__main__':
     args = parser.parse_args(remaining)
     # redirect output to a sibling "videos" folder so it doesn't mix with
     # the CTC-format results from eval_cell.py
-    args.output_dir = str(Path(args.output_dir).parent / 'cell_moma_videos')
+    args.output_dir = str(args.output_dir)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     main(args)

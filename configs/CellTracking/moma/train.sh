@@ -3,18 +3,18 @@
 # SelfMOTR — Cell Tracking — Training launcher
 #
 # Usage (single GPU):
-#   bash configs/CellTracking/train.sh
+#   bash configs/CellTracking/moma/train.sh
 #
 # Usage (multi-GPU, e.g. 2):
-#   NUM_GPUS=2 bash configs/CellTracking/train.sh
+#   NUM_GPUS=2 bash configs/CellTracking/moma/train.sh
 #
 # Any extra arguments are forwarded and override the YAML:
-#   bash configs/CellTracking/train.sh --epochs 50
+#   bash configs/CellTracking/moma/train.sh --epochs 50
 # ============================================================
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 CONFIG="${SCRIPT_DIR}/train.yaml"
 NUM_GPUS=${NUM_GPUS:-1}
 

@@ -1,0 +1,93 @@
+# ============================================================
+# SelfMOTR — DeepCell — Inference / eval config
+# ============================================================
+
+# --- paths ---
+mot_path: /srv/home/chen/Cell-TRACTR/data/deepcell/COCO
+output_dir: /srv/home/chen/cell_motr/self/outputs/cell_deepcell_eval
+resume: /srv/home/chen/cell_motr/self/outputs/cell_deepcell/checkpoint.pth
+
+# --- dataset ---
+dataset_file: e2e_cell
+meta_arch: motrv2_self
+
+# --- model (must match training config exactly) ---
+backbone: resnet50
+num_feature_levels: 4
+enc_layers: 6
+dec_layers: 6
+dim_feedforward: 1024
+hidden_dim: 256
+nheads: 8
+dec_n_points: 4
+enc_n_points: 4
+num_anchors: 1
+with_box_refine: true
+two_stage: false
+shared_decoder: true
+
+# --- queries (must match training) ---
+num_queries: 350
+num_queries_detect: 500
+
+# --- query interaction (must match training) ---
+query_interaction_layer: QIMv2
+random_drop: 0.0
+fp_ratio: 0.0
+merger_dropout: 0.0
+dropout: 0.0
+
+# --- inference thresholds ---
+score_threshold: 0.5
+update_score_threshold: 0.5
+proposal_threshold: 0.05
+miss_tolerance: 5
+
+# --- split to evaluate ---
+split: val
+
+# --- encoder cache reuse ---
+reuse_encoder_cache: true
+
+# --- viz_cell.py settings ---
+div_threshold: 0.35   # lowered: unweighted div BCE → scores cluster 0.35–0.49; retrain with pos_weight for better calibration
+fps: 8
+scale: 1   # deepcell images are already 584×600; no upscaling needed
+
+# --- sampling (only affects dataloader) ---
+sample_mode: fixed_interval
+sample_interval: 1
+sampler_lengths: [1]
+sampler_steps: ~
+
+# --- division prediction ---
+div_loss_coef: 1.0
+
+# --- runtime ---
+batch_size: 1
+num_workers: 2
+device: cuda
+seed: 42
+
+# --- output format ---
+masks: false
+
+# --- unused / keep defaults ---
+aux_loss: true
+cls_loss_coef: 2.0
+bbox_loss_coef: 5.0
+giou_loss_coef: 2.0
+set_cost_class: 2.0
+set_cost_bbox: 5.0
+set_cost_giou: 2.0
+focal_alpha: 0.25
+mask_loss_coef: 1.0
+dice_loss_coef: 1.0
+memory_bank_type: ~
+memory_bank_score_thresh: 0.0
+memory_bank_len: 4
+memory_bank_with_self_attn: false
+use_checkpoint: false
+accum_iter: 1
+query_denoise: 0.0
+lambda_detect: 0.5

@@ -1,0 +1,105 @@
+# ============================================================
+# SelfMOTR — DeepCell — Training config
+# ============================================================
+# DeepCell is much denser than moma:
+#   - up to 308 cells/frame (mean ~70), vs moma's ~17
+#   - images are 584×600 px (vs moma's ~32×256)
+# Key differences from moma train.yaml:
+#   - num_queries: 350  (covers max cells/frame with headroom)
+#   - num_queries_detect: 500
+#   - mot_path / output_dir point to deepcell
+# ============================================================
+
+# --- paths ---
+mot_path: /srv/home/chen/Cell-TRACTR/data/deepcell/COCO
+output_dir: /srv/home/chen/cell_motr/self/outputs/cell_deepcell
+pretrained: /srv/home/chen/self/ckpt/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth
+
+# --- dataset ---
+dataset_file: e2e_cell
+meta_arch: motrv2_self
+
+# --- model ---
+backbone: resnet50
+num_feature_levels: 4
+enc_layers: 6
+dec_layers: 6
+dim_feedforward: 1024
+hidden_dim: 256
+nheads: 8
+dec_n_points: 4
+enc_n_points: 4
+num_anchors: 1
+with_box_refine: true
+two_stage: false
+shared_decoder: true
+
+# --- queries ---
+# deepcell: max 308 cells/frame, mean ~70 → use 350 track queries
+# num_queries_detect: detection proposals fed to the tracker
+num_queries: 350
+num_queries_detect: 500
+
+# --- query interaction ---
+query_interaction_layer: QIMv2
+random_drop: 0.1
+fp_ratio: 0.1
+merger_dropout: 0.0
+dropout: 0.0
+
+# --- sampling / curriculum ---
+sample_mode: random_interval
+sample_interval: 5
+sampler_lengths: [2, 3, 4]
+sampler_steps: [5, 10]
+
+# --- optimiser ---
+lr: 2.0e-4
+lr_backbone: 2.0e-5
+lr_backbone_names: ["backbone.0"]
+lr_linear_proj_names: ["reference_points", "sampling_offsets"]
+lr_linear_proj_mult: 0.1
+weight_decay: 1.0e-4
+clip_max_norm: 0.1
+sgd: false
+
+# --- schedule ---
+epochs: 30
+lr_drop: 20
+save_period: 5
+
+# --- loss weights ---
+cls_loss_coef: 2.0
+bbox_loss_coef: 5.0
+giou_loss_coef: 2.0
+set_cost_class: 2.0
+set_cost_bbox: 5.0
+set_cost_giou: 2.0
+focal_alpha: 0.25
+aux_loss: true
+
+# --- division prediction ---
+# pos_weight=20 is baked into the loss in motrv2_self.py to handle class imbalance
+# (dividing cells are ~2-5% of all matched pairs in deepcell)
+div_loss_coef: 1.0
+
+# --- self-proposal ---
+score_threshold: 0.05
+lambda_detect: 0.5
+query_denoise: 0.05
+
+# --- training utilities ---
+batch_size: 1
+accum_iter: 1
+num_workers: 2
+reuse_encoder_cache: true
+device: cuda
+seed: 42
+use_checkpoint: false   # set true if OOM (gradient checkpointing saves VRAM)
+
+# --- unused / keep defaults ---
+masks: false
+memory_bank_type: ~
+memory_bank_score_thresh: 0.0
+memory_bank_len: 4
+memory_bank_with_self_attn: false

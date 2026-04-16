@@ -3,17 +3,17 @@
 # SelfMOTR — Cell Tracking — Inference launcher
 #
 # Usage:
-#   bash configs/CellTracking/infer.sh
+#   bash configs/CellTracking/moma/infer.sh
 #
 # Override any YAML value on the command line:
-#   bash configs/CellTracking/infer.sh --split train
-#   bash configs/CellTracking/infer.sh --resume outputs/cell_moma/checkpoint0009.pth
-#   bash configs/CellTracking/infer.sh --score_threshold 0.4 --miss_tolerance 15
+#   bash configs/CellTracking/moma/infer.sh --split train
+#   bash configs/CellTracking/moma/infer.sh --resume outputs/cell_moma/checkpoint0009.pth
+#   bash configs/CellTracking/moma/infer.sh --score_threshold 0.4 --miss_tolerance 15
 # ============================================================
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 CONFIG="${SCRIPT_DIR}/infer.yaml"
 
 # Read output_dir from YAML so we can mkdir before inference starts

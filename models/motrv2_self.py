@@ -303,7 +303,11 @@ class ClipMatcher(SetCriterion):
                 tgt_idx = matched_indices[valid_mask, 1]
                 pred_div = track_instances.pred_div_ahead[src_idx]          # [N]
                 gt_div   = gt_instances_i.div_flags[tgt_idx].to(pred_div)  # [N]
-                loss_div = F.binary_cross_entropy_with_logits(pred_div, gt_div)
+                # pos_weight compensates for class imbalance: dividing cells are
+                # typically ~2-5% of all cells, so weight positives ~20× higher.
+                pos_weight = torch.tensor(20.0, device=pred_div.device)
+                loss_div = F.binary_cross_entropy_with_logits(
+                    pred_div, gt_div, pos_weight=pos_weight)
             else:
                 loss_div = track_instances.pred_div_ahead.sum() * 0.0  # zero, keeps grad graph
             self.losses_dict[
