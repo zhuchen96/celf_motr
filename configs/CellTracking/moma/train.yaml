@@ -85,6 +85,11 @@ aux_loss: true
 # Set to 0.0 to disable if man_track is not available.
 div_loss_coef: 1.0
 
+# --- division-clip oversampling ---
+# Fraction of training clips guaranteed to contain a dividing cell.
+# 0.0 = uniform sampling.  Recommended: 0.3–0.5 for rare-division datasets.
+div_ratio: 0.3
+
 # --- self-proposal ---
 score_threshold: 0.05
 lambda_detect: 0.5

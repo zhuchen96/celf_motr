@@ -129,12 +129,18 @@ def _box_center(box):
     return ((x1 + x2) / 2, (y1 + y2) / 2)
 
 
+def _box_diag(box):
+    x1, y1, x2, y2 = box
+    return ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+
+
 def _center_dist(c1, c2):
     return ((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2) ** 0.5
 
 
 def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
-                      out_dir: Path, div_threshold: float = 0.5):
+                      out_dir: Path, div_threshold: float = 0.5,
+                      max_div_dist_factor: float = 2.0):
     """
     Write CTC-format results:
       mask{t:03d}.tif  — uint16 label images (rectangle fill from boxes)
@@ -198,8 +204,10 @@ def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
                 if div_score < div_threshold:
                     continue   # not predicted as dividing
 
-                # Find the 2 new tracks closest to the parent's last centre
+                # Find the 2 new tracks closest to the parent's last centre,
+                # within max_div_dist_factor × parent box diagonal.
                 parent_ctr = _box_center(last_box)
+                max_dist   = _box_diag(last_box) * max_div_dist_factor
                 new_with_dist = []
                 for dlabel in new_labels:
                     if parent[dlabel] != 0:
@@ -207,9 +215,9 @@ def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
                     d_info = track_span.get(dlabel)
                     if d_info is None:
                         continue
-                    d_box = d_info[2]
-                    dist = _center_dist(parent_ctr, _box_center(d_box))
-                    new_with_dist.append((dist, dlabel))
+                    dist = _center_dist(parent_ctr, _box_center(d_info[2]))
+                    if dist <= max_dist:
+                        new_with_dist.append((dist, dlabel))
 
                 new_with_dist.sort()
                 for _, dlabel in new_with_dist[:2]:
@@ -287,7 +295,8 @@ def main(args):
 
         out_dir = output_root / f'{seq_key}_RES'
         write_ctc_results(per_frame, img_dir, frame_files, out_dir,
-                          div_threshold=args.div_threshold)
+                          div_threshold=args.div_threshold,
+                          max_div_dist_factor=args.max_div_dist_factor)
         print(f"  seq {seq_key}: {len(frame_files)} frames → {out_dir}")
 
 
@@ -325,6 +334,8 @@ if __name__ == '__main__':
                         help='Frames before a lost track is dropped')
     parser.add_argument('--div_threshold', default=0.5, type=float,
                         help='sigmoid(pred_div_ahead) >= this → flag as dividing parent')
+    parser.add_argument('--max_div_dist_factor', default=2.0, type=float,
+                        help='Max daughter distance as multiple of parent box diagonal')
 
     if pre_args.config is not None:
         _apply_yaml_defaults(parser, pre_args.config)

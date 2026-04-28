@@ -191,6 +191,14 @@ def get_args_parser():
     parser.add_argument('--div_loss_coef', type=float, default=1.0,
                         help='Weight for the division-ahead BCE loss (0 to disable)')
 
+    # Division-clip oversampling.
+    # Fraction of each epoch's clips that are guaranteed to contain at least one
+    # dividing cell.  0.0 = uniform sampling (default).  0.3 = 30% of clips
+    # are drawn from the division-containing pool (with replacement if the pool
+    # is smaller than needed).
+    parser.add_argument('--div_ratio', type=float, default=0.0,
+                        help='Fraction of training clips containing a division event (0–1)')
+
     return parser
 
 

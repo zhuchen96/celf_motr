@@ -129,19 +129,94 @@ class CTCCellDataset:
               f"dividing_cells_flagged={n_dividing}")
         print(f"sampler_steps={self.sampler_steps} lengths={self.lengths}")
 
+        # ------------------------------------------------------------------
+        # Division-clip oversampling
+        # Partition all (seq_idx, start) clips into two pools: those that
+        # contain at least one dividing cell within the sampling window, and
+        # those that do not.  _rebuild_indices() mixes them at div_ratio each
+        # epoch so that division events are not lost in the noise.
+        # ------------------------------------------------------------------
+        self.div_ratio = getattr(args, 'div_ratio', 0.0)
+
+        # Precompute which (seq_idx, frame_pos) frames have a dividing cell
+        dividing_positions = set()
+        for seq_idx, (seq_key, img_ids) in enumerate(self.sequences):
+            for fp, img_id in enumerate(img_ids):
+                img_meta = self.images[img_id]
+                frame_nb = int(re.findall(r'\d+', img_meta['file_name'])[-1])
+                for ann in self.anns_by_image[img_id]:
+                    if self.div_lookup.get((seq_key, ann['track_id'], frame_nb), False):
+                        dividing_positions.add((seq_idx, fp))
+                        break   # one dividing cell is enough to flag the frame
+
+        # A clip (seq_idx, start) is "div-containing" if any frame within the
+        # maximum possible window [start, start + (max_len-1)*max_interval]
+        # is a dividing frame.
+        max_window = (max(self.lengths) - 1) * self.sample_interval
+        self._div_indices    = []
+        self._nondiv_indices = []
+        for seq_idx, start in self.indices:
+            n_frames = len(self.sequences[seq_idx][1])
+            end = min(start + max_window, n_frames - 1)
+            if any((seq_idx, fp) in dividing_positions for fp in range(start, end + 1)):
+                self._div_indices.append((seq_idx, start))
+            else:
+                self._nondiv_indices.append((seq_idx, start))
+
+        print(f"  div-containing clips: {len(self._div_indices)}, "
+              f"non-div clips: {len(self._nondiv_indices)}, "
+              f"div_ratio={self.div_ratio}")
+
+        self._rebuild_indices()
+
     # ------------------------------------------------------------------
     # Epoch / curriculum support (mirrors DetMOTDetection interface)
     # ------------------------------------------------------------------
 
+    def _rebuild_indices(self):
+        """
+        Rebuild self.indices from the div / non-div pools at the configured ratio.
+
+        With div_ratio=0 (default) this is a no-op: all clips are used as-is.
+        With div_ratio=r, exactly floor(total * r) clips are drawn from the
+        div-containing pool (with replacement when the pool is smaller than
+        needed) and the rest from the non-div pool.  Both pools are shuffled
+        with an epoch-seeded RNG so the mix changes every epoch.
+        """
+        if self.div_ratio <= 0.0 or not self._div_indices:
+            self.indices = self._nondiv_indices + self._div_indices
+            return
+
+        rng   = np.random.default_rng(self.current_epoch)
+        total = len(self._div_indices) + len(self._nondiv_indices)
+        n_div = int(total * self.div_ratio)
+        n_non = total - n_div
+
+        # Sample div clips (with replacement if the pool is smaller than needed)
+        replace_div = len(self._div_indices) < n_div
+        div_pick = rng.choice(len(self._div_indices), size=n_div,
+                              replace=replace_div).tolist()
+        sampled_div = [self._div_indices[i] for i in div_pick]
+
+        # Sample non-div clips without replacement (cap at pool size)
+        n_non = min(n_non, len(self._nondiv_indices))
+        non_pick = rng.choice(len(self._nondiv_indices), size=n_non,
+                              replace=False).tolist()
+        sampled_non = [self._nondiv_indices[i] for i in non_pick]
+
+        combined = sampled_div + sampled_non
+        rng.shuffle(combined)
+        self.indices = [tuple(x) for x in combined]
+
     def set_epoch(self, epoch):
         self.current_epoch = epoch
-        if not self.sampler_steps:
-            return
-        for i, step in enumerate(self.sampler_steps):
-            if epoch >= step:
-                self.period_idx = i + 1
-        print(f"set epoch: epoch {epoch} period_idx={self.period_idx}")
-        self.num_frames_per_batch = self.lengths[self.period_idx]
+        if self.sampler_steps:
+            for i, step in enumerate(self.sampler_steps):
+                if epoch >= step:
+                    self.period_idx = i + 1
+            print(f"set epoch: epoch {epoch} period_idx={self.period_idx}")
+            self.num_frames_per_batch = self.lengths[self.period_idx]
+        self._rebuild_indices()
 
     def step_epoch(self):
         print(f"Dataset: epoch {self.current_epoch} finishes")

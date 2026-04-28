@@ -137,21 +137,99 @@ def run_sequence(model, img_dir: Path, frame_files: list,
 
 
 # --------------------------------------------------------------------------- #
+# Division linking                                                              #
+# --------------------------------------------------------------------------- #
+
+def _box_center(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+def _center_dist(c1, c2):
+    return ((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2) ** 0.5
+
+
+def _box_diag(box):
+    x1, y1, x2, y2 = box
+    return ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+
+
+def find_division_pairs(frames: list, div_threshold: float,
+                        max_dist_factor: float = 2.0, line_frames: int = 4):
+    """
+    Identify daughter-pair lines to draw after each division event.
+
+    A new track is only considered a daughter candidate if its centre is within
+    ``max_dist_factor × parent_box_diagonal`` of the parent's last centre.
+    This prevents far-away unrelated tracks from being mistakenly linked.
+
+    Returns
+    -------
+    div_lines : dict  {frame_t: [(tid1, tid2), ...]}
+        At frame t a line should be drawn between tid1 and tid2 (daughters).
+        Lines are drawn for ``line_frames`` consecutive frames starting from
+        the frame the daughters first appear.
+    """
+    track_last = {}   # tid → (last_frame, last_box, last_div_score)
+    assigned   = set()  # daughter tids already given a parent
+    div_lines  = defaultdict(list)
+
+    for t, frame in enumerate(frames):
+        active = {tr[0]: tr[1] for tr in frame['tracks']}   # tid → box
+
+        if t > 0:
+            prev_active = {tr[0] for tr in frames[t - 1]['tracks']}
+            ended  = prev_active - set(active)
+            new_tids = set(active) - prev_active
+
+            for ptid in ended:
+                info = track_last.get(ptid)
+                if info is None:
+                    continue
+                last_t, last_box, div_score = info
+                if last_t != t - 1 or div_score < div_threshold:
+                    continue
+
+                parent_ctr = _box_center(last_box)
+                max_dist   = _box_diag(last_box) * max_dist_factor
+                candidates = []
+                for d in new_tids:
+                    if d in assigned or d not in active:
+                        continue
+                    dist = _center_dist(parent_ctr, _box_center(active[d]))
+                    if dist <= max_dist:
+                        candidates.append((dist, d))
+                candidates.sort()
+                if len(candidates) >= 2:
+                    d1, d2 = candidates[0][1], candidates[1][1]
+                    assigned.add(d1)
+                    assigned.add(d2)
+                    for dt in range(line_frames):
+                        div_lines[t + dt].append((d1, d2))
+
+        for tid, box, div_score in frame['tracks']:
+            track_last[tid] = (t, box, div_score)
+
+    return div_lines
+
+
+# --------------------------------------------------------------------------- #
 # Video rendering                                                               #
 # --------------------------------------------------------------------------- #
 
 def render_video(frames: list, out_path: Path, fps: int, scale: int,
-                 div_threshold: float):
+                 div_threshold: float, div_lines: dict = None):
     """
     Render one MP4 video from a list of annotated frames.
 
     Parameters
     ----------
-    frames      : output of run_sequence()
-    out_path    : path to write the .mp4 file
-    fps         : frames per second
-    scale       : integer upscale factor (images are tiny; 8× is readable)
+    frames        : output of run_sequence()
+    out_path      : path to write the .mp4 file
+    fps           : frames per second
+    scale         : integer upscale factor (images are tiny; 8× is readable)
     div_threshold : sigmoid(pred_div_ahead) ≥ this → flag as mitotic
+    div_lines     : output of find_division_pairs(); draws lines between daughters
     """
     if not frames:
         return
@@ -208,6 +286,28 @@ def render_video(frames: list, out_path: Path, fps: int, scale: int,
             cv2.putText(img_bgr, label, (lx, ly),
                         cv2_font, font_scale, color, font_thick,
                         cv2.LINE_AA)
+
+        # --- division lines: connect daughter pairs ---
+        if div_lines:
+            tid_to_box = {tid: box for tid, box, _ in frame['tracks']}
+            for d1, d2 in div_lines.get(t, []):
+                box1 = tid_to_box.get(d1)
+                box2 = tid_to_box.get(d2)
+                if box1 is None or box2 is None:
+                    continue
+                cx1 = int(round(((box1[0] + box1[2]) / 2) * scale))
+                cy1 = int(round(((box1[1] + box1[3]) / 2) * scale))
+                cx2 = int(round(((box2[0] + box2[2]) / 2) * scale))
+                cy2 = int(round(((box2[1] + box2[3]) / 2) * scale))
+                # bright magenta line between daughter centres
+                cv2.line(img_bgr, (cx1, cy1), (cx2, cy2), (255, 0, 255), max(1, font_thick), cv2.LINE_AA)
+                # cyan box highlight on each daughter at birth
+                for box in (box1, box2):
+                    bx1 = max(0, int(round(box[0] * scale)))
+                    by1 = max(0, int(round(box[1] * scale)))
+                    bx2 = min(out_W - 1, int(round(box[2] * scale)))
+                    by2 = min(out_H - 1, int(round(box[3] * scale)))
+                    cv2.rectangle(img_bgr, (bx1, by1), (bx2, by2), (255, 255, 0), font_thick + 1)
 
         # --- frame number overlay ---
         cv2.putText(img_bgr, f't={t:03d}', (2, out_H - 4),
@@ -275,11 +375,18 @@ def main(args):
             device=device,
         )
 
+        div_lines = find_division_pairs(frames, div_threshold=args.div_threshold,
+                                        max_dist_factor=args.max_div_dist_factor)
+        n_div = sum(len(v) for v in div_lines.values())
+        if n_div:
+            print(f"    {n_div // max(1, args.fps)} division events linked")
+
         out_path = output_root / f'{seq_key}.avi'
         render_video(frames, out_path,
                      fps=args.fps,
                      scale=args.scale,
-                     div_threshold=args.div_threshold)
+                     div_threshold=args.div_threshold,
+                     div_lines=div_lines)
         print(f"  seq {seq_key}: {len(fnames)} frames → {out_path}")
 
 
@@ -312,6 +419,8 @@ if __name__ == '__main__':
     parser.add_argument('--miss_tolerance', default=10, type=int)
     parser.add_argument('--div_threshold', default=0.5, type=float,
                         help='sigmoid(pred_div_ahead) >= this → mark as mitotic')
+    parser.add_argument('--max_div_dist_factor', default=2.0, type=float,
+                        help='Max daughter distance as multiple of parent box diagonal')
     parser.add_argument('--fps', default=8, type=int,
                         help='Frames per second of output video')
     parser.add_argument('--scale', default=8, type=int,

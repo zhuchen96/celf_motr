@@ -50,7 +50,8 @@ split: val
 reuse_encoder_cache: true
 
 # --- viz_cell.py settings ---
-div_threshold: 0.35   # lowered: unweighted div BCE → scores cluster 0.35–0.49; retrain with pos_weight for better calibration
+div_threshold: 0.1   # lowered: unweighted div BCE → scores cluster 0.35–0.49; retrain with pos_weight for better calibration
+max_div_dist_factor: 2.0   # daughters must be within 2× parent box diagonal; prevents false far-away links
 fps: 8
 scale: 1   # deepcell images are already 584×600; no upscaling needed
 

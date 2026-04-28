@@ -57,10 +57,12 @@ split: val
 reuse_encoder_cache: true
 
 # --- viz_cell.py settings ---
-# div_threshold: sigmoid(pred_div_ahead) >= this → mark cell as mitotic (yellow box + "M")
+# div_threshold:       sigmoid(pred_div_ahead) >= this → mark cell as mitotic (yellow box + "M")
+# max_div_dist_factor: daughter must be within this many × parent-box-diagonal of the parent centre
 # fps:   output video frame rate
 # scale: integer upscale factor (raw images are ~32×256 px; 8× → 256×2048)
 div_threshold: 0.5
+max_div_dist_factor: 2.0
 fps: 8
 scale: 8
 
