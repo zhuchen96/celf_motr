@@ -27,7 +27,7 @@ two_stage: false
 shared_decoder: true
 
 # --- queries (must match training) ---
-num_queries: 350
+num_queries: 300
 num_queries_detect: 500
 
 # --- query interaction (must match training) ---
@@ -38,10 +38,15 @@ merger_dropout: 0.0
 dropout: 0.0
 
 # --- inference thresholds ---
-score_threshold: 0.5
-update_score_threshold: 0.5
+score_threshold: 0.3          # lowered from 0.4: cells scoring 0.35-0.45 were fragmenting
+update_score_threshold: 0.3   # same — controls when RuntimeTrackerBase assigns/kills IDs
 proposal_threshold: 0.05
 miss_tolerance: 5
+div_score_thresh: 0.4         # separate gate for division firing (pred_div_score head)
+
+# --- gap closing (post-processing) ---
+gap_close_frames: 5          # stitch tracks separated by up to this many frames
+gap_close_dist_factor: 1.5   # max stitching distance as × of the smaller track's box diagonal
 
 # --- split to evaluate ---
 split: val
@@ -50,8 +55,10 @@ split: val
 reuse_encoder_cache: true
 
 # --- viz_cell.py settings ---
-div_threshold: 0.1   # lowered: unweighted div BCE → scores cluster 0.35–0.49; retrain with pos_weight for better calibration
-max_div_dist_factor: 2.0   # daughters must be within 2× parent box diagonal; prevents false far-away links
+# div_threshold: fallback for rendering only (not a model gate — divisions are now
+# triggered by pred_div_score >= score_threshold, same as normal cell detection)
+div_threshold: 0.5
+max_div_dist_factor: 2.0
 fps: 8
 scale: 1   # deepcell images are already 584×600; no upscaling needed
 

@@ -5,8 +5,7 @@ Runs inference on every sequence in the chosen split and writes one MP4 per
 sequence showing:
   - Bounding boxes coloured by track ID (consistent across frames)
   - Track ID label in the top-left corner of each box
-  - "M" marker + yellow box border on cells with a high division score
-    (pred_div_ahead sigmoid > --div_threshold)
+  - "M" marker + yellow box border on confirmed dividing cells (via parent_id linkage)
 
 Usage:
     python viz_cell.py --config configs/CellTracking/infer.yaml
@@ -90,7 +89,7 @@ def run_sequence(model, img_dir: Path, frame_files: list,
                     box_xyxy in absolute pixel coords of the COCO image
         }
     """
-    model.track_base.clear()
+    model.clear()
     track_instances = None
     results = []
 
@@ -121,15 +120,27 @@ def run_sequence(model, img_dir: Path, frame_files: list,
         dt = dt[keep]
 
         tracks = []
-        has_div = dt.has('pred_div_ahead')
-        if has_div and len(dt) > 0:
-            scores_sigmoid = torch.sigmoid(dt.pred_div_ahead)
-            if scores_sigmoid.max() > 0.3:   # only print when anything is notable
-                print(f'    frame div scores: min={scores_sigmoid.min():.3f} '
-                      f'max={scores_sigmoid.max():.3f} mean={scores_sigmoid.mean():.3f}')
+        has_div    = dt.has('pred_div_score')
+        has_db     = dt.has('pred_div_boxes')
+        has_parent = dt.has('parent_obj_id')
+        ori_h, ori_w = ori_size
+        scale_fct = torch.tensor([ori_w, ori_h, ori_w, ori_h], dtype=torch.float32)
         for i, (tid, box) in enumerate(zip(dt.obj_idxes.tolist(), dt.boxes.tolist())):
-            div_score = float(torch.sigmoid(dt.pred_div_ahead[i])) if has_div else 0.0
-            tracks.append((int(tid), box, div_score))
+            div_score = float(torch.sigmoid(dt.pred_div_score[i])) if has_div else 0.0
+            # Store daughter positions as pixel xyxy so _find_daughters_by_prediction
+            # can use proper Euclidean distance against track boxes (also pixel xyxy).
+            # box (dt.boxes[i]) is already pixel xyxy via post_process.
+            # pred_div_boxes is still normalised cxcywh → convert here.
+            if has_db:
+                from util import box_ops
+                d1 = box   # pixel xyxy of daughter1 (current track position)
+                d2_norm = dt.pred_div_boxes[i].cpu()
+                d2 = (box_ops.box_cxcywh_to_xyxy(d2_norm) * scale_fct).tolist()
+                div_boxes = list(d1) + d2
+            else:
+                div_boxes = None
+            parent_id = int(dt.parent_obj_id[i]) if has_parent else -1
+            tracks.append((int(tid), box, div_score, div_boxes, parent_id))
 
         results.append({'raw': raw, 'ori_size': ori_size, 'tracks': tracks})
 
@@ -137,7 +148,7 @@ def run_sequence(model, img_dir: Path, frame_files: list,
 
 
 # --------------------------------------------------------------------------- #
-# Division linking                                                              #
+# Geometry helpers                                                              #
 # --------------------------------------------------------------------------- #
 
 def _box_center(box):
@@ -154,63 +165,172 @@ def _box_diag(box):
     return ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
 
 
+# --------------------------------------------------------------------------- #
+# Gap closing                                                                   #
+# --------------------------------------------------------------------------- #
+
+def close_gaps(frames: list, max_gap: int = 5,
+               max_dist_factor: float = 1.5) -> list:
+    """
+    Stitch broken track fragments that belong to the same physical cell.
+
+    When track A ends at tA and track B starts at tB with tB - tA <= max_gap+1,
+    and B's first position is within max_dist_factor × A's box diagonal of A's
+    last centre, B is relabeled to A throughout the sequence.
+    """
+    track_last  = {}
+    track_first = {}
+    # Daughter tracks (parent_id >= 0) must not be merged into the mother — they
+    # are intentional new tracks created by the division split mechanism.
+    daughter_tids = set()
+    for t, frame in enumerate(frames):
+        for entry in frame['tracks']:
+            tid, box = entry[0], entry[1]
+            parent_id = entry[4] if len(entry) > 4 else -1
+            if parent_id >= 0:
+                daughter_tids.add(tid)
+            if tid not in track_first:
+                track_first[tid] = (t, box)
+            track_last[tid] = (t, box)
+
+    uf_parent = {}
+    def find(x):
+        while uf_parent.get(x, x) != x:
+            uf_parent[x] = uf_parent.get(uf_parent[x], uf_parent[x])
+            x = uf_parent[x]
+        return x
+    def union(a, b):
+        uf_parent[find(b)] = find(a)
+
+    for tid_b, (t_b, box_b) in sorted(track_first.items(), key=lambda kv: kv[1][0]):
+        if tid_b in daughter_tids:
+            continue  # never merge a daughter into its mother or another track
+        best_tid, best_dist = None, float('inf')
+        max_dist = _box_diag(box_b) * max_dist_factor
+        for tid_a, (t_a, box_a) in track_last.items():
+            if find(tid_a) == find(tid_b):
+                continue
+            gap = t_b - t_a
+            if gap < 1 or gap > max_gap + 1:
+                continue
+            dist = _center_dist(_box_center(box_a), _box_center(box_b))
+            if dist < max_dist and dist < best_dist:
+                best_dist, best_tid = dist, tid_a
+        if best_tid is not None:
+            union(best_tid, tid_b)
+
+    if not uf_parent:
+        return frames
+
+    new_frames = []
+    for frame in frames:
+        seen = set()
+        new_tracks = []
+        for entry in frame['tracks']:
+            tid = entry[0]
+            root = find(tid)
+            if root not in seen:
+                new_tracks.append((root,) + entry[1:])
+                seen.add(root)
+        new_frames.append({**frame, 'tracks': new_tracks})
+
+    merged = sum(1 for t in track_first if find(t) != t)
+    print(f'  gap closing: merged {merged} fragments')
+    return new_frames
+
+
+# --------------------------------------------------------------------------- #
+# Division linking                                                              #
+# --------------------------------------------------------------------------- #
+
 def find_division_pairs(frames: list, div_threshold: float,
                         max_dist_factor: float = 2.0, line_frames: int = 4):
     """
     Identify daughter-pair lines to draw after each division event.
 
-    A new track is only considered a daughter candidate if its centre is within
-    ``max_dist_factor × parent_box_diagonal`` of the parent's last centre.
-    This prevents far-away unrelated tracks from being mistakenly linked.
+    D1 (the mother query) continues with its existing track ID.
+    D2 is spawned by the model with parent_obj_id = D1's track ID.
+    Division pairs are read directly from parent_obj_id — no spatial search needed.
 
     Returns
     -------
-    div_lines : dict  {frame_t: [(tid1, tid2), ...]}
-        At frame t a line should be drawn between tid1 and tid2 (daughters).
-        Lines are drawn for ``line_frames`` consecutive frames starting from
-        the frame the daughters first appear.
+    div_lines : dict  {frame_t: [(d1_tid, d2_tid), ...]}
+    confirmed_parent_tids : set  — these tids show the yellow "M" marker
     """
-    track_last = {}   # tid → (last_frame, last_box, last_div_score)
-    assigned   = set()  # daughter tids already given a parent
-    div_lines  = defaultdict(list)
+    div_lines             = defaultdict(list)
+    confirmed_parent_tids = set()
+    d2_first_frame: dict  = {}   # d2_tid → (first_t, parent_tid)
 
     for t, frame in enumerate(frames):
-        active = {tr[0]: tr[1] for tr in frame['tracks']}   # tid → box
+        for entry in frame['tracks']:
+            tid, box, div_score, div_boxes, parent_id = entry
+            if parent_id >= 0 and tid not in d2_first_frame:
+                d2_first_frame[tid] = (t, parent_id)
 
-        if t > 0:
-            prev_active = {tr[0] for tr in frames[t - 1]['tracks']}
-            ended  = prev_active - set(active)
-            new_tids = set(active) - prev_active
+    for d2_tid, (t, parent_tid) in d2_first_frame.items():
+        confirmed_parent_tids.add(parent_tid)
+        for dt in range(line_frames):
+            div_lines[t + dt].append((parent_tid, d2_tid))
 
-            for ptid in ended:
-                info = track_last.get(ptid)
-                if info is None:
-                    continue
-                last_t, last_box, div_score = info
-                if last_t != t - 1 or div_score < div_threshold:
-                    continue
+    return div_lines, confirmed_parent_tids
 
-                parent_ctr = _box_center(last_box)
-                max_dist   = _box_diag(last_box) * max_dist_factor
-                candidates = []
-                for d in new_tids:
-                    if d in assigned or d not in active:
-                        continue
-                    dist = _center_dist(parent_ctr, _box_center(active[d]))
-                    if dist <= max_dist:
-                        candidates.append((dist, d))
-                candidates.sort()
-                if len(candidates) >= 2:
-                    d1, d2 = candidates[0][1], candidates[1][1]
-                    assigned.add(d1)
-                    assigned.add(d2)
-                    for dt in range(line_frames):
-                        div_lines[t + dt].append((d1, d2))
 
-        for tid, box, div_score in frame['tracks']:
-            track_last[tid] = (t, box, div_score)
+def _find_daughters_by_prediction(div_boxes_8d, new_tids, active, assigned,
+                                   max_dist_factor):
+    """Find daughters closest to each predicted daughter position.
 
-    return div_lines
+    div_boxes_8d: 8 floats [x1,y1,x2,y2, x1,y1,x2,y2] in pixel xyxy for d1 and d2.
+    All boxes in active are also pixel xyxy, so distances are in the same space.
+    """
+    pred_ctrs = [
+        ((div_boxes_8d[0] + div_boxes_8d[2]) / 2,
+         (div_boxes_8d[1] + div_boxes_8d[3]) / 2),   # daughter 1 centre (pixels)
+        ((div_boxes_8d[4] + div_boxes_8d[6]) / 2,
+         (div_boxes_8d[5] + div_boxes_8d[7]) / 2),   # daughter 2 centre (pixels)
+    ]
+    chosen = []
+    remaining = [d for d in new_tids if d not in assigned]
+    for pred_cx, pred_cy in pred_ctrs:
+        best, best_dist = None, float('inf')
+        for d in remaining:
+            if d in chosen:
+                continue
+            entry = active.get(d)
+            if entry is None:
+                continue
+            box = entry[1]
+            x1, y1, x2, y2 = box
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            # Enforce max distance: predicted daughter must be within max_dist_factor
+            # × its own box diagonal to prevent linking far unrelated tracks.
+            diag = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            max_dist = diag * max_dist_factor
+            dist = ((cx - pred_cx) ** 2 + (cy - pred_cy) ** 2) ** 0.5
+            if dist <= max_dist and dist < best_dist:
+                best_dist, best = dist, d
+        if best is not None:
+            chosen.append(best)
+    return chosen
+
+
+def _find_daughters_by_proximity(last_box, new_tids, active, assigned,
+                                  max_dist_factor):
+    """Fallback: find daughters closest to parent's last centre."""
+    parent_ctr = _box_center(last_box)
+    max_dist   = _box_diag(last_box) * max_dist_factor
+    candidates = []
+    for d in new_tids:
+        if d in assigned:
+            continue
+        entry = active.get(d)
+        if entry is None:
+            continue
+        dist = _center_dist(parent_ctr, _box_center(entry[1]))
+        if dist <= max_dist:
+            candidates.append((dist, d))
+    candidates.sort()
+    return [d for _, d in candidates[:2]]
 
 
 # --------------------------------------------------------------------------- #
@@ -218,7 +338,8 @@ def find_division_pairs(frames: list, div_threshold: float,
 # --------------------------------------------------------------------------- #
 
 def render_video(frames: list, out_path: Path, fps: int, scale: int,
-                 div_threshold: float, div_lines: dict = None):
+                 div_threshold: float, div_lines: dict = None,
+                 confirmed_parent_tids: set = None):
     """
     Render one MP4 video from a list of annotated frames.
 
@@ -228,7 +349,7 @@ def render_video(frames: list, out_path: Path, fps: int, scale: int,
     out_path      : path to write the .mp4 file
     fps           : frames per second
     scale         : integer upscale factor (images are tiny; 8× is readable)
-    div_threshold : sigmoid(pred_div_ahead) ≥ this → flag as mitotic
+    div_threshold : fallback threshold for mitotic marker when no parent_id linkage exists
     div_lines     : output of find_division_pairs(); draws lines between daughters
     """
     if not frames:
@@ -260,7 +381,7 @@ def render_video(frames: list, out_path: Path, fps: int, scale: int,
         img_bgr = cv2.resize(img_bgr, (out_W, out_H), interpolation=cv2.INTER_NEAREST)
 
         # --- draw tracks ---
-        for tid, box, div_score in frame['tracks']:
+        for tid, box, div_score, *_rest in frame['tracks']:
             x1, y1, x2, y2 = box
             # scale box to upscaled image coords
             sx1 = int(round(x1 * scale))
@@ -271,7 +392,12 @@ def render_video(frames: list, out_path: Path, fps: int, scale: int,
             sy1, sy2 = max(0, sy1), min(out_H - 1, sy2)
 
             color = track_color(tid)
-            mitotic = div_score >= div_threshold
+            # D1's div_score is suppressed after spawning D2; use confirmed_parent_tids
+            # (populated by find_division_pairs) to reliably mark dividing cells.
+            if confirmed_parent_tids:
+                mitotic = tid in confirmed_parent_tids
+            else:
+                mitotic = div_score >= div_threshold
 
             if mitotic:
                 # bright yellow border for dividing cells
@@ -289,7 +415,7 @@ def render_video(frames: list, out_path: Path, fps: int, scale: int,
 
         # --- division lines: connect daughter pairs ---
         if div_lines:
-            tid_to_box = {tid: box for tid, box, _ in frame['tracks']}
+            tid_to_box = {tid: box for tid, box, *_ in frame['tracks']}
             for d1, d2 in div_lines.get(t, []):
                 box1 = tid_to_box.get(d1)
                 box2 = tid_to_box.get(d2)
@@ -361,7 +487,7 @@ def main(args):
 
     print(f"Visualising {len(seq_to_imgs)} sequences  "
           f"(split={args.split}, score_thr={args.score_threshold}, "
-          f"div_thr={args.div_threshold}, scale={args.scale}×, fps={args.fps})")
+          f"scale={args.scale}×, fps={args.fps})")
 
     for seq_key in tqdm(sorted(seq_to_imgs.keys()), desc='sequences'):
         imgs     = seq_to_imgs[seq_key]
@@ -375,8 +501,14 @@ def main(args):
             device=device,
         )
 
-        div_lines = find_division_pairs(frames, div_threshold=args.div_threshold,
-                                        max_dist_factor=args.max_div_dist_factor)
+        if args.gap_close_frames > 0:
+            frames = close_gaps(frames,
+                                max_gap=args.gap_close_frames,
+                                max_dist_factor=args.gap_close_dist_factor)
+
+        div_lines, confirmed_parents = find_division_pairs(
+            frames, div_threshold=args.div_threshold,
+            max_dist_factor=args.max_div_dist_factor)
         n_div = sum(len(v) for v in div_lines.values())
         if n_div:
             print(f"    {n_div // max(1, args.fps)} division events linked")
@@ -386,7 +518,8 @@ def main(args):
                      fps=args.fps,
                      scale=args.scale,
                      div_threshold=args.div_threshold,
-                     div_lines=div_lines)
+                     div_lines=div_lines,
+                     confirmed_parent_tids=confirmed_parents)
         print(f"  seq {seq_key}: {len(fnames)} frames → {out_path}")
 
 
@@ -418,9 +551,13 @@ if __name__ == '__main__':
     parser.add_argument('--update_score_threshold', default=0.5, type=float)
     parser.add_argument('--miss_tolerance', default=10, type=int)
     parser.add_argument('--div_threshold', default=0.5, type=float,
-                        help='sigmoid(pred_div_ahead) >= this → mark as mitotic')
+                        help='fallback threshold for mitotic marker (unused when model provides parent_id)')
     parser.add_argument('--max_div_dist_factor', default=2.0, type=float,
                         help='Max daughter distance as multiple of parent box diagonal')
+    parser.add_argument('--gap_close_frames', default=5, type=int,
+                        help='Max frame gap to stitch broken tracks (0 = disabled)')
+    parser.add_argument('--gap_close_dist_factor', default=1.5, type=float,
+                        help='Max stitch distance as multiple of the box diagonal')
     parser.add_argument('--fps', default=8, type=int,
                         help='Frames per second of output video')
     parser.add_argument('--scale', default=8, type=int,

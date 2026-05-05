@@ -48,7 +48,7 @@ from util.tool import apply_checkpoint_model_args, load_model, load_torch_checkp
 
 
 # --------------------------------------------------------------------------- #
-# Image loading / preprocessing (mirrors ctc_cell.py / make_transforms_cell)  #
+# Image loading / preprocessing                                                 #
 # --------------------------------------------------------------------------- #
 
 MEAN = [0.485, 0.456, 0.406]
@@ -58,9 +58,9 @@ STD  = [0.229, 0.224, 0.225]
 def load_and_preprocess(img_path: Path):
     """Load a .tif frame and return (tensor [1,3,H,W], (H, W))."""
     img = Image.open(img_path).convert('RGB')
-    w, h = img.size          # PIL: (width, height)
+    w, h = img.size
     tensor = TF.normalize(TF.to_tensor(img), MEAN, STD)
-    return tensor.unsqueeze(0), (h, w)   # ori_img_size = (H, W)
+    return tensor.unsqueeze(0), (h, w)
 
 
 # --------------------------------------------------------------------------- #
@@ -76,10 +76,14 @@ def track_sequence(model, img_dir: Path, frame_files: list,
     Returns
     -------
     per_frame : list of lists
-        per_frame[t] = [(track_id: int, box_xyxy: [x1,y1,x2,y2], div_score: float), ...]
-        div_score = sigmoid(pred_div_ahead) in [0, 1]; high → cell is about to divide
+        per_frame[t] = [(track_id, box_xyxy, div_score, div_boxes_8d, parent_id), ...]
+          track_id    : int, globally unique
+          box_xyxy    : [x1, y1, x2, y2] in absolute pixel coords
+          div_score   : float in [0,1] — sigmoid(pred_div_ahead)
+          div_boxes_8d: list[8] normalised cxcywh for both daughters, or None
+          parent_id   : int, parent track ID if this track was created by division, else -1
     """
-    model.track_base.clear()
+    model.clear()
     track_instances = None
     per_frame = []
 
@@ -110,11 +114,23 @@ def track_sequence(model, img_dir: Path, frame_files: list,
         keep = (dt.obj_idxes >= 0) & (dt.scores > score_threshold)
         dt = dt[keep]
 
-        has_div = dt.has('pred_div_ahead')
+        has_div    = dt.has('pred_div_ahead')
+        has_db     = dt.has('pred_div_boxes')
+        has_parent = dt.has('parent_obj_id')
+
         frame_tracks = []
-        for i, (tid, box) in enumerate(zip(dt.obj_idxes.tolist(), dt.boxes.tolist())):
-            div_score = float(torch.sigmoid(dt.pred_div_ahead[i])) if has_div else 0.0
-            frame_tracks.append((int(tid), box, div_score))
+        for idx, (tid, box) in enumerate(zip(dt.obj_idxes.tolist(), dt.boxes.tolist())):
+            div_score  = float(torch.sigmoid(dt.pred_div_ahead[idx])) if has_div else 0.0
+            # pred_boxes (4D, normalised cxcywh) = daughter1; pred_div_boxes (4D) = daughter2.
+            # Concatenate to 8D for write_ctc_results which expects [d1(4), d2(4)].
+            if has_db:
+                d1 = dt.pred_boxes[idx].cpu().tolist()
+                d2 = dt.pred_div_boxes[idx].cpu().tolist()
+                div_boxes = d1 + d2
+            else:
+                div_boxes = None
+            parent_id  = int(dt.parent_obj_id[idx]) if has_parent else -1
+            frame_tracks.append((int(tid), box, div_score, div_boxes, parent_id))
         per_frame.append(frame_tracks)
 
     return per_frame
@@ -138,37 +154,102 @@ def _center_dist(c1, c2):
     return ((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2) ** 0.5
 
 
+def close_gaps(per_frame: list, max_gap: int = 5,
+               max_dist_factor: float = 1.5) -> list:
+    """
+    Stitch broken track fragments that belong to the same physical cell.
+    """
+    track_last  = {}
+    track_first = {}
+    for t, frame_tracks in enumerate(per_frame):
+        for tid, box, *_ in frame_tracks:
+            if tid not in track_first:
+                track_first[tid] = (t, box)
+            track_last[tid] = (t, box)
+
+    parent = {}
+    def find(x):
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+    def union(a, b):
+        parent[find(b)] = find(a)
+
+    for tid_b, (t_b, box_b) in sorted(track_first.items(), key=lambda kv: kv[1][0]):
+        best_tid, best_dist = None, float('inf')
+        max_dist = _box_diag(box_b) * max_dist_factor
+
+        for tid_a, (t_a, box_a) in track_last.items():
+            if find(tid_a) == find(tid_b):
+                continue
+            gap = t_b - t_a
+            if gap < 1 or gap > max_gap + 1:
+                continue
+            dist = _center_dist(_box_center(box_a), _box_center(box_b))
+            if dist < max_dist and dist < best_dist:
+                best_dist, best_tid = dist, tid_a
+
+        if best_tid is not None:
+            union(best_tid, tid_b)
+
+    if not parent:
+        return per_frame
+
+    new_per_frame = []
+    for frame_tracks in per_frame:
+        seen = set()
+        new_frame = []
+        for tid, box, div_score, div_boxes, par in frame_tracks:
+            root = find(tid)
+            if root not in seen:
+                new_frame.append((root, box, div_score, div_boxes, par))
+                seen.add(root)
+        new_per_frame.append(new_frame)
+
+    merged = sum(1 for t in track_first if find(t) != t)
+    print(f'    gap closing: merged {merged} fragments into longer tracks')
+    return new_per_frame
+
+
 def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
                       out_dir: Path, div_threshold: float = 0.5,
                       max_div_dist_factor: float = 2.0):
     """
     Write CTC-format results:
-      mask{t:03d}.tif  — uint16 label images (rectangle fill from boxes)
+      mask{t:03d}.tif  — uint16 label images
       res_track.txt    — L B E P
 
-    Division linking
-    ----------------
-    A track is flagged as a dividing parent when its div_score at its LAST
-    observed frame exceeds div_threshold.  The two new tracks that start in
-    the very next frame and are spatially closest to the parent's last position
-    are assigned as daughters (P = parent label).
+    Division linking (Cell-TRACTR style)
+    ------------------------------------
+    When a track's last frame has div_score >= div_threshold, we look for
+    daughter candidates in the next frame.
+
+    If the track has pred_div_boxes (model-predicted daughter positions), we
+    use those as anchors for the search — one candidate per predicted position,
+    each within max_div_dist_factor × parent_box_diagonal.
+
+    If pred_div_boxes is unavailable (old checkpoint), we fall back to the
+    distance-to-parent-center heuristic.
+
+    Tracks created by the model's query-duplication mechanism already have
+    parent_id set; we use those directly where available.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     first = Image.open(img_dir / frame_files[0]).convert('L')
-    W, H = first.size   # PIL: (width, height)
+    W, H = first.size
 
     # label = tid + 1 (CTC labels must be > 0)
-    # track_span[label] = [first_frame, last_frame, last_box, max_div_score_at_last_frame]
+    # track_span[label] = [first_frame, last_frame, last_box, max_div_score, div_boxes_8d]
     track_span: dict = {}
-    # label -> parent label (0 = no parent)
-    parent: dict = {}
+    parent: dict = {}   # label → parent label (0 = no parent)
 
     for t, frame_tracks in enumerate(per_frame):
         label_img = np.zeros((H, W), dtype=np.uint16)
         active_labels = set()
 
-        for tid, box, div_score in frame_tracks:
+        for tid, box, div_score, div_boxes, par_tid in frame_tracks:
             label = int(tid) + 1
             active_labels.add(label)
             x1, y1, x2, y2 = box
@@ -178,19 +259,20 @@ def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
                 label_img[y1:y2, x1:x2] = label
 
             if label not in track_span:
-                track_span[label] = [t, t, box, div_score]
-                parent[label] = 0
+                track_span[label] = [t, t, box, div_score, div_boxes]
+                # Use model-provided parent ID if available
+                parent[label] = (int(par_tid) + 1) if par_tid >= 0 else 0
             else:
-                track_span[label][1] = t          # update last frame
-                track_span[label][2] = box        # update last box
-                track_span[label][3] = div_score  # update div score at last frame
+                track_span[label][1] = t
+                track_span[label][2] = box
+                track_span[label][3] = div_score
+                track_span[label][4] = div_boxes
 
         cv2.imwrite(str(out_dir / f'mask{t:03d}.tif'), label_img)
 
-        # --- division linking ---
-        # Tracks that were active last frame but are gone now = ended at t-1
+        # --- division linking for tracks without a model-provided parent ---
         if t > 0:
-            prev_labels = {int(tid) + 1 for tid, _, _ in per_frame[t - 1]}
+            prev_labels = {int(tid) + 1 for tid, *_ in per_frame[t - 1]}
             ended = prev_labels - active_labels
             new_labels = active_labels - prev_labels
 
@@ -198,38 +280,91 @@ def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
                 info = track_span.get(plabel)
                 if info is None:
                     continue
-                _, end_t, last_box, div_score = info
-                if end_t != t - 1:
-                    continue   # ended earlier, already processed
-                if div_score < div_threshold:
-                    continue   # not predicted as dividing
+                _, end_t, last_box, div_score, div_boxes = info
+                if end_t != t - 1 or div_score < div_threshold:
+                    continue
 
-                # Find the 2 new tracks closest to the parent's last centre,
-                # within max_div_dist_factor × parent box diagonal.
-                parent_ctr = _box_center(last_box)
-                max_dist   = _box_diag(last_box) * max_div_dist_factor
-                new_with_dist = []
-                for dlabel in new_labels:
-                    if parent[dlabel] != 0:
-                        continue  # already assigned a parent
-                    d_info = track_span.get(dlabel)
-                    if d_info is None:
-                        continue
-                    dist = _center_dist(parent_ctr, _box_center(d_info[2]))
-                    if dist <= max_dist:
-                        new_with_dist.append((dist, dlabel))
+                # Collect unassigned new tracks
+                unassigned = [dl for dl in new_labels if parent.get(dl, 0) == 0]
 
-                new_with_dist.sort()
-                for _, dlabel in new_with_dist[:2]:
-                    parent[dlabel] = plabel
+                if div_boxes is not None:
+                    # Use model-predicted daughter positions as anchors
+                    _link_daughters_by_prediction(
+                        plabel, div_boxes, unassigned, track_span,
+                        parent, W, H, max_div_dist_factor)
+                else:
+                    # Fallback: search near parent's last position
+                    _link_daughters_by_proximity(
+                        plabel, last_box, unassigned, track_span,
+                        parent, max_div_dist_factor)
 
-    # Write res_track.txt:  L  B  E  P
     n_div = sum(1 for p in parent.values() if p != 0)
-    print(f'    division events detected: {n_div // 2} '
+    print(f'    division events: {n_div // 2} '
           f'({n_div} daughter tracks with parent links)')
     with open(out_dir / 'res_track.txt', 'w') as f:
-        for label, (b, e, _, _) in sorted(track_span.items()):
+        for label, (b, e, *_) in sorted(track_span.items()):
             f.write(f'{label} {b} {e} {parent.get(label, 0)}\n')
+
+
+def _link_daughters_by_prediction(plabel, div_boxes_8d, unassigned, track_span,
+                                   parent, W, H, max_dist_factor):
+    """
+    Link daughters using the model's predicted daughter positions.
+
+    div_boxes_8d = [d1_cx, d1_cy, d1_w, d1_h, d2_cx, d2_cy, d2_w, d2_h]
+    in normalised [0,1] coordinates.  We convert to pixel xyxy, then find the
+    closest unassigned track to each predicted position.
+    """
+    def norm_to_px(cx, cy, bw, bh):
+        x1 = (cx - bw / 2) * W
+        y1 = (cy - bh / 2) * H
+        x2 = (cx + bw / 2) * W
+        y2 = (cy + bh / 2) * H
+        return [x1, y1, x2, y2]
+
+    d1_box = norm_to_px(*div_boxes_8d[:4])
+    d2_box = norm_to_px(*div_boxes_8d[4:])
+
+    # For each predicted daughter, find the closest unassigned new track
+    chosen = []
+    remaining = list(unassigned)
+    for pred_box in (d1_box, d2_box):
+        pred_ctr = _box_center(pred_box)
+        pred_diag = _box_diag(pred_box)
+        max_dist = pred_diag * max_dist_factor if pred_diag > 1 else float('inf')
+        best, best_dist = None, float('inf')
+        for dl in remaining:
+            if dl in chosen:
+                continue
+            d_info = track_span.get(dl)
+            if d_info is None:
+                continue
+            dist = _center_dist(pred_ctr, _box_center(d_info[2]))
+            if dist < max_dist and dist < best_dist:
+                best_dist, best = dist, dl
+        if best is not None:
+            chosen.append(best)
+
+    for dl in chosen:
+        parent[dl] = plabel
+
+
+def _link_daughters_by_proximity(plabel, last_box, unassigned, track_span,
+                                  parent, max_dist_factor):
+    """Fallback: link daughters by proximity to parent's last position."""
+    parent_ctr = _box_center(last_box)
+    max_dist   = _box_diag(last_box) * max_dist_factor
+    candidates = []
+    for dl in unassigned:
+        d_info = track_span.get(dl)
+        if d_info is None:
+            continue
+        dist = _center_dist(parent_ctr, _box_center(d_info[2]))
+        if dist <= max_dist:
+            candidates.append((dist, dl))
+    candidates.sort()
+    for _, dl in candidates[:2]:
+        parent[dl] = plabel
 
 
 # --------------------------------------------------------------------------- #
@@ -237,9 +372,6 @@ def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
 # --------------------------------------------------------------------------- #
 
 def main(args):
-    # ------------------------------------------------------------------ #
-    # Load checkpoint and rebuild model args                               #
-    # ------------------------------------------------------------------ #
     checkpoint = load_torch_checkpoint(args.resume, map_location='cpu',
                                        weights_only=False)
     args = apply_checkpoint_model_args(args, checkpoint, context='eval_cell')
@@ -256,9 +388,7 @@ def main(args):
     model.eval()
     model.to(device)
 
-    # ------------------------------------------------------------------ #
-    # Discover sequences from COCO annotation                              #
-    # ------------------------------------------------------------------ #
+
     mot_root = Path(args.mot_path)
     ann_file = mot_root / 'annotations' / args.split / 'anno.json'
     img_dir  = mot_root / args.split / 'img'
@@ -266,7 +396,6 @@ def main(args):
     with open(ann_file) as f:
         data = json.load(f)
 
-    # Group images by sequence, sorted by frame_id
     seq_to_imgs = defaultdict(list)
     for img in data['images']:
         seq_key = img.get('ctc_id', img.get('man_track_id', 'unknown'))
@@ -293,6 +422,11 @@ def main(args):
             device=device,
         )
 
+        if args.gap_close_frames > 0:
+            per_frame = close_gaps(per_frame,
+                                   max_gap=args.gap_close_frames,
+                                   max_dist_factor=args.gap_close_dist_factor)
+
         out_dir = output_root / f'{seq_key}_RES'
         write_ctc_results(per_frame, img_dir, frame_files, out_dir,
                           div_threshold=args.div_threshold,
@@ -317,25 +451,21 @@ if __name__ == '__main__':
         overrides = {k.replace('-', '_'): v for k, v in cfg.items() if v is not None}
         parser.set_defaults(**overrides)
 
-    # pre-parse to find --config before building the full parser
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', default=None)
     pre_args, remaining = pre.parse_known_args()
 
     parser = argparse.ArgumentParser(
         'SelfMOTR cell inference', parents=[get_args_parser()])
-    parser.add_argument('--split', default='val', choices=['train', 'val'],
-                        help='Dataset split to run inference on')
-    parser.add_argument('--proposal_threshold', default=0.05, type=float,
-                        help='Confidence threshold for self-proposals')
-    parser.add_argument('--update_score_threshold', default=0.5, type=float,
-                        help='Score threshold used by RuntimeTrackerBase')
-    parser.add_argument('--miss_tolerance', default=10, type=int,
-                        help='Frames before a lost track is dropped')
-    parser.add_argument('--div_threshold', default=0.5, type=float,
-                        help='sigmoid(pred_div_ahead) >= this → flag as dividing parent')
-    parser.add_argument('--max_div_dist_factor', default=2.0, type=float,
-                        help='Max daughter distance as multiple of parent box diagonal')
+    parser.add_argument('--split', default='val', choices=['train', 'val'])
+    parser.add_argument('--proposal_threshold', default=0.05, type=float)
+    parser.add_argument('--update_score_threshold', default=0.5, type=float)
+    parser.add_argument('--miss_tolerance', default=10, type=int)
+    parser.add_argument('--div_score_thresh', default=0.4, type=float)
+    parser.add_argument('--div_threshold', default=0.5, type=float)
+    parser.add_argument('--max_div_dist_factor', default=2.0, type=float)
+    parser.add_argument('--gap_close_frames', default=5, type=int)
+    parser.add_argument('--gap_close_dist_factor', default=1.5, type=float)
 
     if pre_args.config is not None:
         _apply_yaml_defaults(parser, pre_args.config)

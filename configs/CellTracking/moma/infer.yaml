@@ -48,7 +48,11 @@ dropout: 0.0
 score_threshold: 0.5
 update_score_threshold: 0.5
 proposal_threshold: 0.05
-miss_tolerance: 5
+miss_tolerance: 12
+
+# --- gap closing (post-processing) ---
+gap_close_frames: 5          # stitch tracks separated by up to this many frames
+gap_close_dist_factor: 1.5   # max stitching distance as × of the smaller track's box diagonal
 
 # --- split to evaluate ---
 split: val

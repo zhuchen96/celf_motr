@@ -15,12 +15,27 @@ Expected folder layout (identical to Cell-TRACTR's COCO output):
 Generate this layout from raw CTC data using:
     Cell-TRACTR/scripts/create_coco_dataset_from_CTC.py
 
-Division supervision
---------------------
-When man_track/<split>/<seq>.txt is present, each frame annotation gains a
-``div_flags`` tensor (float32, shape N) where entry i is 1.0 if cell i is
-at its LAST frame before dividing (i.e. daughters appear in the next frame),
-and 0.0 otherwise.  This feeds the ``div_ahead_embed`` head in MOTR.
+Division supervision  (Cell-TRACTR design)
+------------------------------------------
+When man_track/<split>/<seq>.txt is present, the loader implements the same
+temporal design as Cell-TRACTR: supervision happens at the daughters' FIRST
+frame (t+1), not at the mother's last frame.
+
+At frame t+1 the two daughters are merged into a SINGLE GT entry carrying the
+mother's obj_id.  The propagated mother track query therefore matches it
+automatically and is trained to predict both daughter positions simultaneously,
+using current-frame image features rather than extrapolating into the future.
+
+Per-cell GT fields produced by _load_frame
+  ``boxes``           float32 [N,4]  xyxy pixel — daughter1 box for merged entries
+  ``div_flags``       float32 [N]    1.0 for the merged division entry (at t+1)
+  ``div_ahead_flags`` float32 [N]    1.0 for mothers about to divide (at t, for
+                                     the optional div_ahead prediction head)
+  ``div_box2``        float32 [N,4]  xyxy pixel box of daughter2 (zeros otherwise)
+
+div_box2 is stored in the same coordinate system as boxes so it passes through
+all geometric transforms (flip, rotate) transparently.  MotNormalize converts
+it to normalised cxcywh alongside boxes.
 """
 
 import json
@@ -94,14 +109,19 @@ class CTCCellDataset:
         # ------------------------------------------------------------------
         # Division supervision: load man_track/<split>/<seq>.txt
         # Format (CTC spec):  L  B  E  P
-        #   L = cell label in GT mask, B = first frame, E = last frame,
-        #   P = parent label (0 means no division origin)
+        #   L = cell label, B = first frame, E = last frame, P = parent label
         #
-        # A cell C divides when its last frame (E) has exactly 2 daughters
-        # in the file (two rows with P == C).  We flag C at frame E with
-        # div_flag = 1, so the model can learn "this cell is about to split".
+        # Cell-TRACTR design: supervision is at the daughters' FIRST frame.
+        # div_lookup  — flags the mother at her last frame (for div_ahead)
+        # div_daughters — (seq_key, parent_id) → [d1_id, d2_id]
+        # daughter_to_parent / daughter_first_frame — reverse lookups used in
+        #   _load_frame to create merged GT entries at the daughters' birth frame
         # ------------------------------------------------------------------
-        self.div_lookup: dict = {}   # (seq_key, cell_id, frame_nb) → True
+        self.div_lookup: dict = {}        # (seq_key, cell_id, frame_nb) → True
+        self.div_daughters: dict = {}     # (seq_key, parent_id) → [d1_id, d2_id]
+        self.daughter_to_parent: dict = {}   # (seq_key, d_id) → parent_id
+        self.daughter_first_frame: dict = {} # (seq_key, d_id) → first_frame_nb
+
         man_track_dir = root / 'man_track' / image_set
         n_dividing = 0
         if man_track_dir.exists():
@@ -112,13 +132,29 @@ class CTCCellDataset:
                 mt = np.loadtxt(mt_path, dtype=np.int32)
                 if mt.ndim == 1:
                     mt = mt[None]   # single-row file
-                # For each cell that has exactly 2 daughters, flag its last frame
+
+                # Build start-frame lookup for this sequence
+                cell_start_frame = {int(row[0]): int(row[1]) for row in mt}
+
+                # Group children by parent
+                parent_to_daughters: dict = defaultdict(list)
                 for row in mt:
-                    cell_id, start_f, end_f, parent_id = int(row[0]), int(row[1]), int(row[2]), int(row[3])
-                    n_daughters = int((mt[:, 3] == cell_id).sum())
-                    if n_daughters == 2:
+                    p = int(row[3])
+                    if p > 0:
+                        parent_to_daughters[p].append(int(row[0]))
+
+                for row in mt:
+                    cell_id = int(row[0])
+                    end_f   = int(row[2])
+                    daughters = parent_to_daughters.get(cell_id, [])
+                    if len(daughters) == 2:
                         self.div_lookup[(seq_key, cell_id, end_f)] = True
+                        self.div_daughters[(seq_key, cell_id)] = daughters
                         n_dividing += 1
+                        for d_id in daughters:
+                            self.daughter_to_parent[(seq_key, d_id)] = cell_id
+                            self.daughter_first_frame[(seq_key, d_id)] = \
+                                cell_start_frame.get(d_id, -1)
         else:
             print(f"  [CTCCellDataset] man_track dir not found at {man_track_dir}; "
                   "division supervision disabled.")
@@ -131,27 +167,28 @@ class CTCCellDataset:
 
         # ------------------------------------------------------------------
         # Division-clip oversampling
-        # Partition all (seq_idx, start) clips into two pools: those that
-        # contain at least one dividing cell within the sampling window, and
-        # those that do not.  _rebuild_indices() mixes them at div_ratio each
-        # epoch so that division events are not lost in the noise.
+        # Flag both the mother's last frame (div_ahead) and the daughters'
+        # birth frame (division detection) as division-containing positions.
         # ------------------------------------------------------------------
         self.div_ratio = getattr(args, 'div_ratio', 0.0)
 
-        # Precompute which (seq_idx, frame_pos) frames have a dividing cell
         dividing_positions = set()
         for seq_idx, (seq_key, img_ids) in enumerate(self.sequences):
             for fp, img_id in enumerate(img_ids):
                 img_meta = self.images[img_id]
                 frame_nb = int(re.findall(r'\d+', img_meta['file_name'])[-1])
                 for ann in self.anns_by_image[img_id]:
-                    if self.div_lookup.get((seq_key, ann['track_id'], frame_nb), False):
+                    cell_id = ann['track_id']
+                    # Mother at last frame before division
+                    if self.div_lookup.get((seq_key, cell_id, frame_nb), False):
                         dividing_positions.add((seq_idx, fp))
-                        break   # one dividing cell is enough to flag the frame
+                        break
+                    # Daughter at birth frame
+                    if (self.daughter_first_frame.get((seq_key, cell_id)) == frame_nb
+                            and (seq_key, cell_id) in self.daughter_to_parent):
+                        dividing_positions.add((seq_idx, fp))
+                        break
 
-        # A clip (seq_idx, start) is "div-containing" if any frame within the
-        # maximum possible window [start, start + (max_len-1)*max_interval]
-        # is a dividing frame.
         max_window = (max(self.lengths) - 1) * self.sample_interval
         self._div_indices    = []
         self._nondiv_indices = []
@@ -170,19 +207,10 @@ class CTCCellDataset:
         self._rebuild_indices()
 
     # ------------------------------------------------------------------
-    # Epoch / curriculum support (mirrors DetMOTDetection interface)
+    # Epoch / curriculum support
     # ------------------------------------------------------------------
 
     def _rebuild_indices(self):
-        """
-        Rebuild self.indices from the div / non-div pools at the configured ratio.
-
-        With div_ratio=0 (default) this is a no-op: all clips are used as-is.
-        With div_ratio=r, exactly floor(total * r) clips are drawn from the
-        div-containing pool (with replacement when the pool is smaller than
-        needed) and the rest from the non-div pool.  Both pools are shuffled
-        with an epoch-seeded RNG so the mix changes every epoch.
-        """
         if self.div_ratio <= 0.0 or not self._div_indices:
             self.indices = self._nondiv_indices + self._div_indices
             return
@@ -192,13 +220,11 @@ class CTCCellDataset:
         n_div = int(total * self.div_ratio)
         n_non = total - n_div
 
-        # Sample div clips (with replacement if the pool is smaller than needed)
         replace_div = len(self._div_indices) < n_div
         div_pick = rng.choice(len(self._div_indices), size=n_div,
                               replace=replace_div).tolist()
         sampled_div = [self._div_indices[i] for i in div_pick]
 
-        # Sample non-div clips without replacement (cap at pool size)
         n_non = min(n_non, len(self._nondiv_indices))
         non_pick = rng.choice(len(self._nondiv_indices), size=n_non,
                               replace=False).tolist()
@@ -235,34 +261,92 @@ class CTCCellDataset:
         gt.obj_ids = targets['obj_ids']
         if 'div_flags' in targets:
             gt.div_flags = targets['div_flags'][:n_gt]
+        if 'div_ahead_flags' in targets:
+            gt.div_ahead_flags = targets['div_ahead_flags'][:n_gt]
+        if 'div_box2' in targets:
+            gt.div_box2 = targets['div_box2'][:n_gt]
         return gt
 
     def _load_frame(self, seq_idx: int, frame_pos: int):
-        """Load one frame and its annotations, including division flags."""
+        """Load one frame and its annotations (Cell-TRACTR division design).
+
+        At a daughter pair's birth frame the two daughters are merged into one
+        GT entry under the mother's obj_id (div_flags=1, div_box2=d2 xyxy).
+        The mother at her last frame gets div_ahead_flags=1 (div_flags=0).
+        All boxes are stored as xyxy pixel coordinates so they pass through
+        geometric transforms unchanged; MotNormalize converts to cxcywh.
+        """
         seq_key, img_ids = self.sequences[seq_idx]
         image_id = img_ids[frame_pos]
         img_meta = self.images[image_id]
 
-        # PIL handles .tif natively; convert to RGB for 3-channel input
         img = Image.open(self.img_dir / img_meta['file_name']).convert('RGB')
-        w, h = img.size
+        w, h = img.size   # noqa: F841 (used implicitly via xyxy boxes)
 
-        # Extract frame number from filename, e.g. CTC_01_frame_042.tif → 42
         frame_nb = int(re.findall(r'\d+', img_meta['file_name'])[-1])
-
-        # Offset track IDs so they are globally unique across sequences
         seq_offset = seq_idx * 100000
 
         anns = self.anns_by_image[image_id]
-        boxes, labels, obj_ids, div_flags = [], [], [], []
+
+        # ---- Step 1: identify daughters at their birth frame ----
+        # For each pair (d1, d2) born at this frame, we create ONE merged GT
+        # entry under the mother's obj_id.  Both daughter annotations are then
+        # skipped when iterating regular cells.
+        merged: dict = {}     # parent_id → {'d1': ann_or_None, 'd2': ann_or_None}
+        daughter_ids: set = set()
+
         for ann in anns:
+            cell_id = ann['track_id']
+            if (self.daughter_first_frame.get((seq_key, cell_id)) == frame_nb
+                    and (seq_key, cell_id) in self.daughter_to_parent):
+                parent_id = self.daughter_to_parent[(seq_key, cell_id)]
+                siblings  = self.div_daughters.get((seq_key, parent_id), [])
+                if len(siblings) == 2:
+                    d1_id, d2_id = siblings
+                    if parent_id not in merged:
+                        merged[parent_id] = {'d1': None, 'd2': None}
+                    if cell_id == d1_id:
+                        merged[parent_id]['d1'] = ann
+                    else:
+                        merged[parent_id]['d2'] = ann
+                    daughter_ids.add(cell_id)
+
+        # ---- Step 2: build GT tensors ----
+        boxes, labels, obj_ids = [], [], []
+        div_flags, div_ahead_flags, div_box2s = [], [], []
+
+        # Merged division entries (daughters' birth frame)
+        for parent_id, parts in merged.items():
+            d1_ann, d2_ann = parts['d1'], parts['d2']
+            if d1_ann is not None and d2_ann is not None:
+                boxes.append(d1_ann['bbox'])    # daughter1 xyxy
+                labels.append(0)
+                obj_ids.append(parent_id + seq_offset)  # mother's obj_id
+                div_flags.append(1.0)
+                div_ahead_flags.append(0.0)
+                div_box2s.append(torch.tensor(d2_ann['bbox'], dtype=torch.float32))
+            else:
+                # One daughter left the FOV; treat the remaining one as a single cell
+                ann = d1_ann if d1_ann is not None else d2_ann
+                boxes.append(ann['bbox'])
+                labels.append(0)
+                obj_ids.append(parent_id + seq_offset)
+                div_flags.append(0.0)
+                div_ahead_flags.append(0.0)
+                div_box2s.append(torch.zeros(4, dtype=torch.float32))
+
+        # Regular (non-daughter) cells
+        for ann in anns:
+            cell_id = ann['track_id']
+            if cell_id in daughter_ids:
+                continue
+            is_div_ahead = self.div_lookup.get((seq_key, cell_id, frame_nb), False)
             boxes.append(ann['bbox'])
             labels.append(0)
-            obj_ids.append(ann['track_id'] + seq_offset)
-            # div_flag = 1 if this cell is at its last frame before dividing
-            div_flags.append(
-                1.0 if self.div_lookup.get((seq_key, ann['track_id'], frame_nb), False) else 0.0
-            )
+            obj_ids.append(cell_id + seq_offset)
+            div_flags.append(0.0)
+            div_ahead_flags.append(1.0 if is_div_ahead else 0.0)
+            div_box2s.append(torch.zeros(4, dtype=torch.float32))
 
         targets = {
             'dataset': 'CTC_cell',
@@ -270,8 +354,10 @@ class CTCCellDataset:
             'labels': torch.as_tensor(labels, dtype=torch.long),
             'obj_ids': torch.as_tensor(obj_ids, dtype=torch.float64),
             'div_flags': torch.as_tensor(div_flags, dtype=torch.float32),
-            'iscrowd': torch.zeros(len(anns), dtype=torch.bool),
-            'scores': torch.ones(len(anns), dtype=torch.float32),
+            'div_ahead_flags': torch.as_tensor(div_ahead_flags, dtype=torch.float32),
+            'div_box2': torch.stack(div_box2s) if div_box2s else torch.zeros(0, 4),
+            'iscrowd': torch.zeros(len(boxes), dtype=torch.bool),
+            'scores': torch.ones(len(boxes), dtype=torch.float32),
             'image_id': torch.tensor(image_id),
             'size': torch.as_tensor([h, w]),
             'orig_size': torch.as_tensor([h, w]),
@@ -292,7 +378,6 @@ class CTCCellDataset:
         else:
             interval = np.random.randint(1, self.sample_interval + 1)
 
-        # Clamp to sequence bounds
         frame_positions = [
             min(start + i * interval, n_frames - 1)
             for i in range(self.num_frames_per_batch)
@@ -322,12 +407,6 @@ class CTCCellDataset:
 # ------------------------------------------------------------------
 
 def make_transforms_cell(image_set):
-    """
-    Minimal transforms for microscopy cells.
-
-    No large-scale random resize (cells are already small and fixed-size).
-    Horizontal flip + HSV jitter for train, bare normalize for val.
-    """
     normalize = T.MotCompose([
         T.MotToTensor(),
         T.MotNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
@@ -336,6 +415,8 @@ def make_transforms_cell(image_set):
     if image_set == 'train':
         return T.MotCompose([
             T.MotRandomHorizontalFlip(),
+            T.MotRandomVerticalFlip(),
+            T.MotRandomRotate90(),
             T.MOTHSV(),
             normalize,
         ])

@@ -22,6 +22,7 @@ contains  annotations/train/anno.json  and  train/img/*.tif.
 """
 
 import argparse
+import csv
 import datetime
 import random
 import time
@@ -36,6 +37,12 @@ try:
     _YAML_AVAILABLE = True
 except ImportError:
     _YAML_AVAILABLE = False
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _TB_AVAILABLE = True
+except ImportError:
+    _TB_AVAILABLE = False
 
 from util.tool import load_model, load_torch_checkpoint
 import util.misc as utils
@@ -306,6 +313,27 @@ def main(args):
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
 
+    # ------------------------------------------------------------------ #
+    # Logging setup (TensorBoard + CSV, main process only)               #
+    # ------------------------------------------------------------------ #
+    writer = None
+    log_csv_path = output_dir / 'train_log.csv'
+    _CSV_HEADER = [
+        'epoch', 'lr',
+        'loss_total', 'loss_track', 'loss_detect',
+        'loss_cls', 'loss_bbox', 'loss_giou',
+        'loss_div_score', 'loss_div_box', 'loss_div_class',
+        'grad_norm',
+    ]
+    if utils.is_main_process():
+        if _TB_AVAILABLE:
+            writer = SummaryWriter(log_dir=str(output_dir / 'tb_logs'))
+            print(f'TensorBoard logs → {output_dir / "tb_logs"}')
+        if not log_csv_path.exists():
+            with open(log_csv_path, 'w', newline='') as f:
+                csv.writer(f).writerow(_CSV_HEADER)
+        print(f'CSV log         → {log_csv_path}')
+
     print("Start training")
     start_time = time.time()
     dataset_train.set_epoch(args.start_epoch)
@@ -313,12 +341,48 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
-        train_one_epoch_mot_self_proposal(
+        train_stats = train_one_epoch_mot_self_proposal(
             model, criterion, criterion_detect, data_loader_train, optimizer,
             args.score_threshold, device, epoch, args.clip_max_norm,
             args.accum_iter, args.lambda_detect,
             reuse_encoder_cache=args.reuse_encoder_cache)
         lr_scheduler.step()
+
+        # -------------------------------------------------------------- #
+        # Log metrics (main process only)                                 #
+        # -------------------------------------------------------------- #
+        if utils.is_main_process():
+            current_lr = optimizer.param_groups[0]['lr']
+
+            def _sum_keys(prefix):
+                return sum(v for k, v in train_stats.items() if prefix in k)
+
+            row = {
+                'epoch':          epoch,
+                'lr':             current_lr,
+                'loss_total':     train_stats.get('loss_overall', 0.0),
+                'loss_track':     train_stats.get('loss', 0.0),
+                'loss_detect':    train_stats.get('loss_detect', 0.0),
+                'loss_cls':       _sum_keys('loss_ce'),
+                'loss_bbox':      _sum_keys('loss_bbox'),
+                'loss_giou':      _sum_keys('loss_giou'),
+                'loss_div_score': _sum_keys('loss_div_score'),
+                'loss_div_box':   _sum_keys('loss_div_box'),
+                'loss_div_class': _sum_keys('loss_div_class'),
+                'grad_norm':      train_stats.get('grad_norm', 0.0),
+            }
+
+            # TensorBoard
+            if writer is not None:
+                for k, v in row.items():
+                    if k == 'epoch':
+                        continue
+                    group = k.split('_')[0]   # 'loss', 'lr', 'grad'
+                    writer.add_scalar(f'{group}/{k}', v, epoch)
+
+            # CSV (append one row)
+            with open(log_csv_path, 'a', newline='') as f:
+                csv.writer(f).writerow([row[h] for h in _CSV_HEADER])
 
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -337,6 +401,8 @@ def main(args):
 
         dataset_train.step_epoch()
 
+    if writer is not None:
+        writer.close()
     total_time = str(datetime.timedelta(seconds=int(time.time() - start_time)))
     print(f'Training time {total_time}')
 

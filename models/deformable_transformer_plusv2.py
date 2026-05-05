@@ -562,11 +562,13 @@ class DeformableTransformerDecoder(nn.Module):
             if self.bbox_embed is not None:
                 tmp = self.bbox_embed[lid](output)
                 if reference_points.shape[-1] == 4:
-                    new_reference_points = tmp + inverse_sigmoid(reference_points)
+                    # bbox_embed may output >4D (e.g. 8D when a division head is appended);
+                    # only the first 4 channels are the main-box delta used for ref-point update.
+                    new_reference_points = tmp[..., :4] + inverse_sigmoid(reference_points)
                     new_reference_points = new_reference_points.sigmoid()
                 else:
                     assert reference_points.shape[-1] == 2
-                    new_reference_points = tmp
+                    new_reference_points = tmp[..., :2].clone()
                     new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
                     new_reference_points = new_reference_points.sigmoid()
                 reference_points = new_reference_points.detach()

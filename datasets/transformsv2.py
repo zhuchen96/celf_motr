@@ -36,6 +36,9 @@ def crop_mot(image, target, region):
     target["size"] = torch.tensor([h, w])
 
     fields = ["labels", "iscrowd", "obj_ids", "scores"]
+    for _f in ("div_flags", "div_ahead_flags", "div_box2"):
+        if _f in target:
+            fields.append(_f)
 
     if "boxes" in target:
         boxes = target["boxes"]
@@ -45,6 +48,14 @@ def crop_mot(image, target, region):
         cropped_boxes = cropped_boxes.clamp(min=0)
         target["boxes"] = cropped_boxes.reshape(-1, 4)
         fields.append("boxes")
+
+    if "div_box2" in target:
+        db2 = target["div_box2"]
+        max_size = torch.as_tensor([w, h], dtype=torch.float32)
+        db2 = db2 - torch.as_tensor([j, i, j, i])
+        db2 = torch.min(db2.reshape(-1, 2, 2), max_size)
+        db2 = db2.clamp(min=0)
+        target["div_box2"] = db2.reshape(-1, 4)
 
     if "masks" in target:
         # FIXME should we update the area here if there are no boxes?
@@ -81,6 +92,9 @@ def random_shift(image, target, region, sizes):
     target["size"] = torch.tensor([h, w])
 
     fields = ["labels", "scores", "iscrowd", "obj_ids"]
+    for _f in ("div_flags", "div_ahead_flags", "div_box2"):
+        if _f in target:
+            fields.append(_f)
 
     if "boxes" in target:
         boxes = target["boxes"]
@@ -88,6 +102,11 @@ def random_shift(image, target, region, sizes):
         cropped_boxes *= torch.as_tensor([ow / w, oh / h, ow / w, oh / h])
         target["boxes"] = cropped_boxes.reshape(-1, 4)
         fields.append("boxes")
+
+    if "div_box2" in target:
+        db2 = target["div_box2"] - torch.as_tensor([j, i, j, i])
+        db2 = db2 * torch.as_tensor([ow / w, oh / h, ow / w, oh / h])
+        target["div_box2"] = db2.reshape(-1, 4)
 
     if "masks" in target:
         # FIXME should we update the area here if there are no boxes?
@@ -126,6 +145,9 @@ def crop(image, target, region):
     fields = ["labels", "area", "iscrowd"]
     if 'obj_ids' in target:
         fields.append('obj_ids')
+    for _f in ("div_flags", "div_ahead_flags", "div_box2"):
+        if _f in target:
+            fields.append(_f)
 
     if "boxes" in target:
         boxes = target["boxes"]
@@ -138,6 +160,14 @@ def crop(image, target, region):
         target["boxes"] = cropped_boxes.reshape(-1, 4)
         target["area"] = area
         fields.append("boxes")
+
+    if "div_box2" in target:
+        db2 = target["div_box2"]
+        max_size = torch.as_tensor([w, h], dtype=torch.float32)
+        db2 = db2 - torch.as_tensor([j, i, j, i])
+        db2 = torch.min(db2.reshape(-1, 2, 2), max_size)
+        db2 = db2.clamp(min=0)
+        target["div_box2"] = db2.reshape(-1, 4)
 
     if "masks" in target:
         # FIXME should we update the area here if there are no boxes?
@@ -170,6 +200,10 @@ def hflip(image, target):
         boxes = target["boxes"]
         boxes = boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
         target["boxes"] = boxes
+
+    if "div_box2" in target:
+        db2 = target["div_box2"]
+        target["div_box2"] = db2[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
 
     if "masks" in target:
         target['masks'] = target['masks'].flip(-1)
@@ -220,6 +254,10 @@ def resize(image, target, size, max_size=None):
         boxes = target["boxes"]
         scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
         target["boxes"] = scaled_boxes
+
+    if "div_box2" in target:
+        target["div_box2"] = target["div_box2"] * torch.as_tensor(
+            [ratio_width, ratio_height, ratio_width, ratio_height])
 
     if "area" in target:
         area = target["area"]
@@ -443,6 +481,99 @@ class MotRandomHorizontalFlip(RandomHorizontalFlip):
         return imgs, targets
 
 
+def vflip(image, target):
+    flipped_image = F.vflip(image)
+    w, h = image.size
+    target = target.copy()
+    if 'boxes' in target:
+        boxes = target['boxes']
+        # (x1, y1, x2, y2) → (x1, h-y2, x2, h-y1)
+        boxes = boxes[:, [0, 3, 2, 1]] * torch.as_tensor([1, -1, 1, -1]) + torch.as_tensor([0, h, 0, h])
+        target['boxes'] = boxes
+    if 'div_box2' in target:
+        db2 = target['div_box2']
+        target['div_box2'] = db2[:, [0, 3, 2, 1]] * torch.as_tensor([1, -1, 1, -1]) + torch.as_tensor([0, h, 0, h])
+    if 'masks' in target:
+        target['masks'] = target['masks'].flip(-2)
+    return flipped_image, target
+
+
+class MotRandomVerticalFlip(object):
+    def __init__(self, p=0.5):
+        self.p = p
+
+    def __call__(self, imgs, targets):
+        if random.random() < self.p:
+            ret_imgs, ret_targets = [], []
+            for img_i, targets_i in zip(imgs, targets):
+                img_i, targets_i = vflip(img_i, targets_i)
+                ret_imgs.append(img_i)
+                ret_targets.append(targets_i)
+            return ret_imgs, ret_targets
+        return imgs, targets
+
+
+class MotRandomRotate90(object):
+    """Randomly rotate all frames in a clip by 0/90/180/270 degrees.
+
+    The same rotation is applied to every frame so temporal consistency
+    is preserved.  Box coordinates and the 'size' field are updated to
+    match the rotated image dimensions.
+
+    Rotation uses np.rot90 conventions:
+      k=0  →  0°   (no-op)
+      k=1  →  90°  CCW
+      k=2  →  180°
+      k=3  →  90°  CW
+    """
+    def __call__(self, imgs, targets):
+        k = random.randint(0, 3)
+        if k == 0:
+            return imgs, targets
+
+        ret_imgs, ret_targets = [], []
+        for img_i, target_i in zip(imgs, targets):
+            w, h = img_i.size   # PIL (width, height)
+
+            # Rotate image via numpy so PIL.fromarray gives the right size
+            arr = np.array(img_i)           # (H, W, 3)
+            arr = np.rot90(arr, k=k)        # rotated array
+            new_img = Image.fromarray(np.ascontiguousarray(arr))
+
+            target_i = target_i.copy()
+            if 'boxes' in target_i:
+                boxes = target_i['boxes'].clone()  # (N, 4) float, xyxy
+                x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+                if k == 1:   # CCW 90°: (x,y)→(y, w-x), new size [new_H=w, new_W=h]
+                    new_boxes = torch.stack([y1, w - x2, y2, w - x1], dim=1)
+                    new_size  = torch.tensor([w, h])
+                elif k == 2: # 180°:    (x,y)→(w-x, h-y), same size
+                    new_boxes = torch.stack([w - x2, h - y2, w - x1, h - y1], dim=1)
+                    new_size  = target_i['size'].clone()
+                else:        # k==3, CW 90°: (x,y)→(h-y, x), new size [new_H=w, new_W=h]
+                    new_boxes = torch.stack([h - y2, x1, h - y1, x2], dim=1)
+                    new_size  = torch.tensor([w, h])
+                target_i['boxes'] = new_boxes
+                target_i['size']  = new_size
+                if 'orig_size' in target_i:
+                    target_i['orig_size'] = new_size.clone()
+
+            if 'div_box2' in target_i:
+                db2 = target_i['div_box2'].clone()
+                bx1, by1, bx2, by2 = db2[:, 0], db2[:, 1], db2[:, 2], db2[:, 3]
+                if k == 1:   # CCW 90°
+                    target_i['div_box2'] = torch.stack([by1, w - bx2, by2, w - bx1], dim=1)
+                elif k == 2:
+                    target_i['div_box2'] = torch.stack([w - bx2, h - by2, w - bx1, h - by1], dim=1)
+                else:        # k==3, CW 90°
+                    target_i['div_box2'] = torch.stack([h - by2, bx1, h - by1, bx2], dim=1)
+
+            ret_imgs.append(new_img)
+            ret_targets.append(target_i)
+
+        return ret_imgs, ret_targets
+
+
 class RandomResize(object):
     def __init__(self, sizes, max_size=None):
         assert isinstance(sizes, (list, tuple))
@@ -575,6 +706,11 @@ class Normalize(object):
             boxes = box_xyxy_to_cxcywh(boxes)
             boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
             target["boxes"] = boxes
+        if "div_box2" in target:
+            db2 = target["div_box2"]
+            db2 = box_xyxy_to_cxcywh(db2)
+            db2 = db2 / torch.tensor([w, h, w, h], dtype=torch.float32)
+            target["div_box2"] = db2
         return image, target
 
 

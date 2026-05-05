@@ -1,13 +1,10 @@
 # ============================================================
-# SelfMOTR — DeepCell — Training config
+# SelfMOTR — DeepCell — Training config (large run)
 # ============================================================
-# DeepCell is much denser than moma:
-#   - up to 308 cells/frame (mean ~70), vs moma's ~17
-#   - images are 584×600 px (vs moma's ~32×256)
-# Key differences from moma train.yaml:
-#   - num_queries: 350  (covers max cells/frame with headroom)
-#   - num_queries_detect: 500
-#   - mot_path / output_dir point to deepcell
+# Dataset stats (from COCO annotations):
+#   Train: 91 seqs, 6461 frames, cells/frame: mean=70, max=308, p95=223
+#   Val:   27 seqs, 1917 frames, cells/frame: mean=55, max=195, p95=165
+#   Image size: 584×600 px
 # ============================================================
 
 # --- paths ---
@@ -35,9 +32,10 @@ two_stage: false
 shared_decoder: true
 
 # --- queries ---
-# deepcell: max 308 cells/frame, mean ~70 → use 350 track queries
-# num_queries_detect: detection proposals fed to the tracker
-num_queries: 350
+# p95=223 cells/frame → 250 covers nearly all frames.
+# 350 covers the absolute max (308) but costs more VRAM; use 250 on tight GPUs.
+num_queries: 300
+# Detection proposals: ~1.5× num_queries is a good ratio for dense scenes
 num_queries_detect: 500
 
 # --- query interaction ---
@@ -48,10 +46,14 @@ merger_dropout: 0.0
 dropout: 0.0
 
 # --- sampling / curriculum ---
+# 4-stage curriculum: start short for stable early training, grow clip length
+# as the tracker learns to propagate state.
+# sampler_steps epoch thresholds: lengths[0] until epoch 10,
+#   lengths[1] until 25, lengths[2] until 40, then lengths[3].
 sample_mode: random_interval
-sample_interval: 5
-sampler_lengths: [2, 3, 4]
-sampler_steps: [5, 10]
+sample_interval: 1        # MUST be 1: division supervision requires t and t+1 consecutive in same clip
+sampler_lengths: [2, 4, 6, 8]
+sampler_steps: [10, 25, 40]
 
 # --- optimiser ---
 lr: 2.0e-4
@@ -64,8 +66,8 @@ clip_max_norm: 0.1
 sgd: false
 
 # --- schedule ---
-epochs: 30
-lr_drop: 20
+epochs: 50
+lr_drop: 40              # cosine-like: drop at 80% of training
 save_period: 5
 
 # --- loss weights ---
@@ -79,13 +81,18 @@ focal_alpha: 0.25
 aux_loss: true
 
 # --- division prediction ---
-# pos_weight=20 is baked into the loss in motrv2_self.py to handle class imbalance
-# (dividing cells are ~2-5% of all matched pairs in deepcell)
-div_loss_coef: 1.0
+# man_track/ files are present for all 91 train sequences.
+# pos_weight=20 (hardcoded in loss) handles the ~2-5% positive rate within BCE.
+# div_loss_coef scales the whole division loss relative to tracking loss.
+# Do NOT stack a large div_loss_coef with the already-large pos_weight:
+#   pos_weight=20 × div_loss_coef=20 → 400× gradient on dividing cells → instability.
+# div_loss_coef=2.0 keeps division at ~6% of total tracking loss while pos_weight
+# handles the internal class imbalance.
+div_loss_coef: 5.0
 
 # --- division-clip oversampling ---
-# Fraction of training clips guaranteed to contain a dividing cell.
-# 0.0 = uniform sampling.  Recommended: 0.3–0.5 for rare-division datasets.
+# 30% of clips are drawn from the division pool so the model sees dividing
+# cells often enough despite them being a small fraction of total frames.
 div_ratio: 0.3
 
 # --- self-proposal ---
@@ -95,12 +102,16 @@ query_denoise: 0.05
 
 # --- training utilities ---
 batch_size: 1
+# Target effective batch = 4: accum_iter = max(1, 4 // num_gpus)
+#   1 GPU  → --accum_iter 4
+#   2 GPUs → --accum_iter 2
+#   4 GPUs → --accum_iter 1  (default below)
 accum_iter: 1
-num_workers: 2
+num_workers: 4           # cluster nodes typically have ≥8 CPUs
 reuse_encoder_cache: true
 device: cuda
 seed: 42
-use_checkpoint: false   # set true if OOM (gradient checkpointing saves VRAM)
+use_checkpoint: true     # gradient checkpointing: saves VRAM with 300+ queries
 
 # --- unused / keep defaults ---
 masks: false
