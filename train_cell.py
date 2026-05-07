@@ -322,7 +322,7 @@ def main(args):
         'epoch', 'lr',
         'loss_total', 'loss_track', 'loss_detect',
         'loss_cls', 'loss_bbox', 'loss_giou',
-        'loss_div_score', 'loss_div_box', 'loss_div_class',
+        'loss_div_box', 'loss_div_class',
         'grad_norm',
     ]
     if utils.is_main_process():
@@ -366,7 +366,6 @@ def main(args):
                 'loss_cls':       _sum_keys('loss_ce'),
                 'loss_bbox':      _sum_keys('loss_bbox'),
                 'loss_giou':      _sum_keys('loss_giou'),
-                'loss_div_score': _sum_keys('loss_div_score'),
                 'loss_div_box':   _sum_keys('loss_div_box'),
                 'loss_div_class': _sum_keys('loss_div_class'),
                 'grad_norm':      train_stats.get('grad_norm', 0.0),

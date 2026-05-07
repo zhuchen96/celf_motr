@@ -79,7 +79,7 @@ def track_sequence(model, img_dir: Path, frame_files: list,
         per_frame[t] = [(track_id, box_xyxy, div_score, div_boxes_8d, parent_id), ...]
           track_id    : int, globally unique
           box_xyxy    : [x1, y1, x2, y2] in absolute pixel coords
-          div_score   : float in [0,1] — sigmoid(pred_div_ahead)
+          div_score   : float in [0,1] — sigmoid(pred_logits[:, 1]) division channel
           div_boxes_8d: list[8] normalised cxcywh for both daughters, or None
           parent_id   : int, parent track ID if this track was created by division, else -1
     """
@@ -114,13 +114,20 @@ def track_sequence(model, img_dir: Path, frame_files: list,
         keep = (dt.obj_idxes >= 0) & (dt.scores > score_threshold)
         dt = dt[keep]
 
-        has_div    = dt.has('pred_div_ahead')
         has_db     = dt.has('pred_div_boxes')
         has_parent = dt.has('parent_obj_id')
+        # Division score: pred_logits[:, 1] is the division classification channel
+        # (same logit gating _spawn_daughter2_tracks during inference).
+        has_div_logit = (dt.has('pred_logits') and dt.pred_logits.shape[-1] >= 2)
 
         frame_tracks = []
         for idx, (tid, box) in enumerate(zip(dt.obj_idxes.tolist(), dt.boxes.tolist())):
-            div_score  = float(torch.sigmoid(dt.pred_div_ahead[idx])) if has_div else 0.0
+            parent_id  = int(dt.parent_obj_id[idx]) if has_parent else -1
+            div_score  = float(dt.pred_logits[idx, 1].sigmoid()) if has_div_logit else 0.0
+            # Newborn daughters (parent_id >= 0) inherit the mother's high division
+            # logit but must not be treated as dividing parents by write_ctc_results.
+            if parent_id >= 0:
+                div_score = 0.0
             # pred_boxes (4D, normalised cxcywh) = daughter1; pred_div_boxes (4D) = daughter2.
             # Concatenate to 8D for write_ctc_results which expects [d1(4), d2(4)].
             if has_db:
@@ -129,7 +136,6 @@ def track_sequence(model, img_dir: Path, frame_files: list,
                 div_boxes = d1 + d2
             else:
                 div_boxes = None
-            parent_id  = int(dt.parent_obj_id[idx]) if has_parent else -1
             frame_tracks.append((int(tid), box, div_score, div_boxes, parent_id))
         per_frame.append(frame_tracks)
 
@@ -158,11 +164,18 @@ def close_gaps(per_frame: list, max_gap: int = 5,
                max_dist_factor: float = 1.5) -> list:
     """
     Stitch broken track fragments that belong to the same physical cell.
+
+    Daughter tracks (parent_id >= 0) are never merged into other tracks —
+    merging a daughter into the parent would erase the division event from
+    the CTC output.
     """
     track_last  = {}
     track_first = {}
+    daughter_tids = set()
     for t, frame_tracks in enumerate(per_frame):
-        for tid, box, *_ in frame_tracks:
+        for tid, box, div_score, div_boxes, par in frame_tracks:
+            if par >= 0:
+                daughter_tids.add(tid)
             if tid not in track_first:
                 track_first[tid] = (t, box)
             track_last[tid] = (t, box)
@@ -177,6 +190,8 @@ def close_gaps(per_frame: list, max_gap: int = 5,
         parent[find(b)] = find(a)
 
     for tid_b, (t_b, box_b) in sorted(track_first.items(), key=lambda kv: kv[1][0]):
+        if tid_b in daughter_tids:
+            continue  # never stitch a daughter back into its parent track
         best_tid, best_dist = None, float('inf')
         max_dist = _box_diag(box_b) * max_dist_factor
 
@@ -288,9 +303,11 @@ def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
                 unassigned = [dl for dl in new_labels if parent.get(dl, 0) == 0]
 
                 if div_boxes is not None:
-                    # Use model-predicted daughter positions as anchors
+                    # Use model-predicted daughter positions as anchors.
+                    # Pass parent's last box for the distance fallback when
+                    # pred daughter box is degenerate (size < 1 pixel).
                     _link_daughters_by_prediction(
-                        plabel, div_boxes, unassigned, track_span,
+                        plabel, div_boxes, last_box, unassigned, track_span,
                         parent, W, H, max_div_dist_factor)
                 else:
                     # Fallback: search near parent's last position
@@ -306,7 +323,8 @@ def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
             f.write(f'{label} {b} {e} {parent.get(label, 0)}\n')
 
 
-def _link_daughters_by_prediction(plabel, div_boxes_8d, unassigned, track_span,
+def _link_daughters_by_prediction(plabel, div_boxes_8d, parent_last_box,
+                                   unassigned, track_span,
                                    parent, W, H, max_dist_factor):
     """
     Link daughters using the model's predicted daughter positions.
@@ -314,6 +332,11 @@ def _link_daughters_by_prediction(plabel, div_boxes_8d, unassigned, track_span,
     div_boxes_8d = [d1_cx, d1_cy, d1_w, d1_h, d2_cx, d2_cy, d2_w, d2_h]
     in normalised [0,1] coordinates.  We convert to pixel xyxy, then find the
     closest unassigned track to each predicted position.
+
+    max_dist is capped at max_dist_factor × the larger of the predicted daughter
+    box diagonal or the parent's last box diagonal.  When pred_diag < 1 pixel
+    (degenerate prediction) we fall back entirely to the parent diagonal, which
+    prevents spurious long-range linking.
     """
     def norm_to_px(cx, cy, bw, bh):
         x1 = (cx - bw / 2) * W
@@ -324,6 +347,7 @@ def _link_daughters_by_prediction(plabel, div_boxes_8d, unassigned, track_span,
 
     d1_box = norm_to_px(*div_boxes_8d[:4])
     d2_box = norm_to_px(*div_boxes_8d[4:])
+    parent_diag = _box_diag(parent_last_box)  # always > 0 for real tracks
 
     # For each predicted daughter, find the closest unassigned new track
     chosen = []
@@ -331,7 +355,10 @@ def _link_daughters_by_prediction(plabel, div_boxes_8d, unassigned, track_span,
     for pred_box in (d1_box, d2_box):
         pred_ctr = _box_center(pred_box)
         pred_diag = _box_diag(pred_box)
-        max_dist = pred_diag * max_dist_factor if pred_diag > 1 else float('inf')
+        # Use pred_diag if valid, else fall back to parent_diag.
+        # Never allow float('inf') — that links any unassigned track as a daughter.
+        ref_diag = pred_diag if pred_diag > 1 else parent_diag
+        max_dist = ref_diag * max_dist_factor
         best, best_dist = None, float('inf')
         for dl in remaining:
             if dl in chosen:

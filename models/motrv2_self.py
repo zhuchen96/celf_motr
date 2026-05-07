@@ -293,33 +293,72 @@ class ClipMatcher(SetCriterion):
                         l_dict.items()})
 
         # ------------------------------------------------------------------
-        # Division losses
-        # pred_div_score: independent detection probability for daughter2.
-        #   GT = div_flags (1 at the division birth frame for the matched mother).
-        # pred_div_boxes: daughter2 position regression, masked to div frames.
-        # pred_logits[:, num_classes]: auxiliary division-class logit, also
-        #   supervised by div_flags as an extra signal.
+        # Division losses (Cell-TRACTR style: 8-coord bbox_embed + flex_div)
+        #
+        # pred_logits[:, num_classes]: the division classification logit.
+        #   At training: supervised by div_flags (BCE with pos_weight).
+        #   At inference: gates daughter2 spawning in _spawn_daughter2_tracks.
+        # pred_div_boxes (= pred_boxes[:, 4:]): daughter2 position, supervised
+        #   at division frames only.
+        #
+        # flex_div: if the model fires division (logit sigmoid ≥ 0.5) on a cell
+        #   that divides at the NEXT frame rather than the current frame, we
+        #   accept the early prediction and supervise with the next frame's D2 box.
+        #   This aligns training with the model's preferred division timing.
         # ------------------------------------------------------------------
-        has_div = (gt_instances_i.has('div_flags') and
-                   track_instances.has('pred_div_score'))
+        _FLEX_THRESH = 0.5
+        has_div = gt_instances_i.has('div_flags')
         if has_div:
             valid_mask = matched_indices[:, 1] >= 0
             if valid_mask.sum() > 0:
                 src_idx = matched_indices[valid_mask, 0]
                 tgt_idx = matched_indices[valid_mask, 1]
-                pred_div_score = track_instances.pred_div_score[src_idx]
-                gt_div_flags   = gt_instances_i.div_flags[tgt_idx].to(pred_div_score)
+                gt_div_flags = gt_instances_i.div_flags[tgt_idx].to(pred_logits_i)
 
-                pos_weight = torch.tensor(20.0, device=pred_div_score.device)
-                loss_div_score = F.binary_cross_entropy_with_logits(
-                    pred_div_score, gt_div_flags, pos_weight=pos_weight)
+                # --- flex_div: look one frame ahead for early-division predictions ---
+                flex_div_flags = gt_div_flags.clone()
+                flex_div_box2s = (gt_instances_i.div_box2[tgt_idx].to(pred_logits_i.device).clone()
+                                  if gt_instances_i.has('div_box2') else None)
+                frame_i = self._current_frame_idx
+                if frame_i + 1 < len(self.gt_instances):
+                    gt_next = self.gt_instances[frame_i + 1]
+                    if gt_next.has('div_flags') and pred_logits_i.shape[-1] > self.num_classes:
+                        for k in range(len(src_idx)):
+                            if flex_div_flags[k] > 0.5:
+                                continue  # already a true division frame
+                            obj_id = gt_instances_i.obj_ids[tgt_idx[k]]
+                            next_match = (gt_next.obj_ids == obj_id).nonzero(as_tuple=True)[0]
+                            if len(next_match) == 0:
+                                continue
+                            next_t = next_match[0]
+                            if gt_next.div_flags[next_t] < 0.5:
+                                continue  # doesn't divide at t+1 either
+                            # Cell divides at t+1 — check if model fires early
+                            div_score_k = pred_logits_i[src_idx[k], self.num_classes].sigmoid()
+                            if div_score_k >= _FLEX_THRESH:
+                                flex_div_flags[k] = 1.0
+                                if (flex_div_box2s is not None and
+                                        gt_next.has('div_box2')):
+                                    flex_div_box2s[k] = gt_next.div_box2[next_t].to(flex_div_box2s)
 
-                # Daughter2-box regression loss (L1, at division birth frame only)
+                # Division classification loss: pred_logits[:, num_classes] is the
+                # primary division signal.  pos_weight handles ~2-5% positive rate.
+                if pred_logits_i.shape[-1] > self.num_classes:
+                    pred_div_logit = pred_logits_i[src_idx, self.num_classes]
+                    pos_weight_cls = torch.tensor(20.0, device=pred_div_logit.device)
+                    loss_div_class = F.binary_cross_entropy_with_logits(
+                        pred_div_logit, flex_div_flags, pos_weight=pos_weight_cls)
+                    self.losses_dict[
+                        'frame_{}_loss_div_class'.format(self._current_frame_idx)
+                    ] = loss_div_class
+
+                # Daughter2-box regression loss (L1, only at flex_div_flags=1 frames)
                 if gt_instances_i.has('div_box2') and track_instances.has('pred_div_boxes'):
-                    div_cell_mask = gt_div_flags > 0.5
+                    div_cell_mask = flex_div_flags > 0.5
                     if div_cell_mask.sum() > 0:
                         pred_db = track_instances.pred_div_boxes[src_idx[div_cell_mask]]
-                        gt_db   = gt_instances_i.div_box2[tgt_idx[div_cell_mask]].to(pred_db)
+                        gt_db = flex_div_box2s[div_cell_mask] if flex_div_box2s is not None else \
+                                gt_instances_i.div_box2[tgt_idx[div_cell_mask]].to(pred_db)
                         valid_db = gt_db.abs().sum(dim=1) > 1e-6
                         if valid_db.sum() > 0:
                             loss_div_box = F.l1_loss(pred_db[valid_db], gt_db[valid_db])
@@ -331,50 +370,32 @@ class ClipMatcher(SetCriterion):
                         'frame_{}_loss_div_box'.format(self._current_frame_idx)
                     ] = loss_div_box
 
-                # Auxiliary division-class logit (last channel of pred_logits)
-                if pred_logits_i.shape[-1] > self.num_classes:
-                    pred_div_logit = pred_logits_i[src_idx, self.num_classes]
-                    pos_weight_cls = torch.tensor(20.0, device=pred_div_logit.device)
-                    loss_div_class = F.binary_cross_entropy_with_logits(
-                        pred_div_logit, gt_div_flags, pos_weight=pos_weight_cls)
-                    self.losses_dict[
-                        'frame_{}_loss_div_class'.format(self._current_frame_idx)
-                    ] = loss_div_class
-
-                # Training-time D2 spawning.
-                # Inject daughter2 into track_instances so QIM propagates it into the
-                # next frame — mirroring what _spawn_daughter2_tracks does at inference.
-                # Teacher-forced: D2's ref_pts and pred_boxes are set to GT div_box2, so
-                # the model learns to decode and update a freshly-spawned D2 query.
-                # At the next frame, D2 participates in Hungarian matching as an
-                # unmatched slot and gets assigned to daughter2's GT cell.
+                # Training-time D2 spawning (teacher-forced at flex_div frames).
                 if gt_instances_i.has('div_box2'):
-                    d2_mask = gt_div_flags > 0.5
+                    d2_mask = flex_div_flags > 0.5
                     if d2_mask.any():
-                        gt_d2   = gt_instances_i.div_box2[tgt_idx[d2_mask]].to(pred_logits_i.device)
+                        gt_d2 = (flex_div_box2s[d2_mask] if flex_div_box2s is not None else
+                                 gt_instances_i.div_box2[tgt_idx[d2_mask]].to(pred_logits_i.device))
                         valid_d2 = gt_d2.abs().sum(dim=1) > 1e-6
                         if valid_d2.any():
                             div_src = src_idx[d2_mask][valid_d2]
                             mothers = track_instances[div_src]
                             d2      = track_instances[div_src]
                             d2_pos  = gt_d2[valid_d2]
-                            d2.ref_pts    = d2_pos.clone()   # GT daughter2 position
-                            d2.pred_boxes = d2_pos.clone()   # keeps ref_pts stable in QIM update
-                            # score > 0.5 so QIM's training-mode active-track filter includes D2
+                            d2.ref_pts    = d2_pos.clone()
+                            d2.pred_boxes = d2_pos.clone()
                             d2.scores           = torch.ones_like(mothers.scores)
                             d2.iou              = torch.ones_like(mothers.iou)
                             d2.obj_idxes        = torch.full_like(mothers.obj_idxes, -1)
                             d2.disappear_time   = torch.zeros_like(mothers.disappear_time)
                             d2.matched_gt_idxes = torch.full_like(mothers.matched_gt_idxes, -1)
-                            if d2.has('pred_div_score'):
-                                d2.pred_div_score = torch.full_like(mothers.pred_div_score, -5.0)
-                            d2.parent_obj_id = mothers.obj_idxes.clone()
+                            d2.parent_obj_id    = mothers.obj_idxes.clone()
+                            d2.output_embedding = torch.zeros_like(mothers.output_embedding)
+                            _qd = mothers.query_pos.shape[-1] // 4
+                            d2.query_pos        = pos2posemb(d2.ref_pts, num_pos_feats=_qd)
+                            d2.mem_bank         = torch.zeros_like(mothers.mem_bank)
+                            d2.mem_padding_mask = torch.ones_like(mothers.mem_padding_mask)
                             track_instances  = Instances.cat([track_instances, d2])
-                            # Reset mother (D1) ID to -1 so she joins the unmatched pool
-                            # at the next frame and gets re-bound to daughter1_id via
-                            # Hungarian matching. Her ref_pts already points to daughter1
-                            # (QIM sets ref_pts = pred_boxes for high-scoring tracks), so
-                            # she will outcompete cold detection queries for that slot.
                             if track_instances.has('parent_obj_id'):
                                 track_instances.parent_obj_id[div_src] = mothers.obj_idxes.clone()
                             track_instances.obj_idxes[div_src] = -1
@@ -383,7 +404,6 @@ class ClipMatcher(SetCriterion):
                             track_instances.disappear_time[div_src] = torch.zeros_like(mothers.disappear_time)
                             track_instances.matched_gt_idxes[div_src] = torch.full_like(mothers.matched_gt_idxes, -1)
             else:
-                loss_div_score = track_instances.pred_div_score.sum() * 0.0
                 if track_instances.has('pred_div_boxes'):
                     self.losses_dict[
                         'frame_{}_loss_div_box'.format(self._current_frame_idx)
@@ -392,9 +412,6 @@ class ClipMatcher(SetCriterion):
                     self.losses_dict[
                         'frame_{}_loss_div_class'.format(self._current_frame_idx)
                     ] = pred_logits_i[:, self.num_classes].sum() * 0.0
-            self.losses_dict[
-                'frame_{}_loss_div_score'.format(self._current_frame_idx)
-            ] = loss_div_score
 
         self._step()
         return track_instances
@@ -557,10 +574,12 @@ class MOTR(nn.Module):
                 self.class_embed = _get_clones(self.class_embed, num_pred)
                 self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:4], -2.0)
+            nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[6:8], -2.0)
             # hack implementation for iterative bounding box refinement
             self.transformer.decoder.bbox_embed = self.bbox_embed
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:4], -2.0)
+            nn.init.constant_(self.bbox_embed.layers[-1].bias.data[6:8], -2.0)
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
             self.transformer.decoder.bbox_embed = None
@@ -569,13 +588,6 @@ class MOTR(nn.Module):
             self.transformer.decoder.class_embed = self.class_embed
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
-        # Daughter-2 score head: hidden_dim → 1 logit per query.
-        # Independent detection probability for daughter2; high when this query is
-        # a dividing mother at the current frame. Supervised by div_flags (same frame).
-        self.div_score_embed = nn.Linear(hidden_dim, 1)
-        nn.init.zeros_(self.div_score_embed.weight)
-        nn.init.zeros_(self.div_score_embed.bias)
-
         self.post_process = TrackerPostProcess()
         self.track_base = RuntimeTrackerBase()
         self.div_score_thresh = div_score_thresh
@@ -607,10 +619,7 @@ class MOTR(nn.Module):
         track_instances.mem_bank = torch.zeros((len(track_instances), mem_bank_len, d_model), dtype=torch.float32, device=device)
         track_instances.mem_padding_mask = torch.ones((len(track_instances), mem_bank_len), dtype=torch.bool, device=device)
         track_instances.save_period = torch.zeros((len(track_instances), ), dtype=torch.float32, device=device)
-        # Daughter-2 score: raw (pre-sigmoid) logit per query.
-        # High when this track is a dividing mother at the current frame.
-        track_instances.pred_div_score = torch.zeros((len(track_instances),), dtype=torch.float32, device=device)
-        # Daughter-box prediction: normalised cxcywh for daughter2.
+        # Daughter-box prediction: normalised cxcywh for daughter2 (from bbox_embed's last 4 coords).
         track_instances.pred_div_boxes = torch.zeros((len(track_instances), 4), dtype=torch.float32, device=device)
         # Parent track ID: set on the D2 daughter when spawned; -1 otherwise.
         track_instances.parent_obj_id = torch.full((len(track_instances),), -1, dtype=torch.long, device=device)
@@ -622,15 +631,16 @@ class MOTR(nn.Module):
         self.division_log: list = []
 
     def _spawn_daughter2_tracks(self, track_instances: Instances) -> Instances:
-        """At the division frame: for any active track whose pred_div_score fires,
-        spawn both daughter1 and daughter2 as fresh unassigned tracks.
+        """At the division frame: for any active track whose pred_logits[:, 1] (division
+        class logit) exceeds div_score_thresh, spawn D1 (reset mother) and D2 (new query).
         RuntimeTrackerBase will assign new IDs to both after this call."""
-        if not (track_instances.has('pred_div_score') and
-                track_instances.has('pred_div_boxes')):
+        if not track_instances.has('pred_div_boxes'):
             return track_instances
 
-        div_scores = torch.sigmoid(track_instances.pred_div_score)
-        is_dividing = (div_scores >= self.div_score_thresh) & (track_instances.obj_idxes >= 0)
+        # Division signal: class_embed channel 1 (pred_logits[:, num_classes]).
+        # This is the same logit supervised by loss_div_class during training.
+        div_scores = torch.sigmoid(track_instances.pred_logits[:, self.num_classes])
+        is_dividing = (div_scores >= self.div_score_thresh) & (track_instances.obj_idxes >= 0) & (track_instances.scores >= self.track_base.filter_score_thresh)
 
         # One-frame cooldown: just-born daughters and freshly-divided mothers both
         # carry parent_obj_id >= 0, preventing immediate re-division.
@@ -649,6 +659,21 @@ class MOTR(nn.Module):
         if len(dividing_idxs) == 0:
             return track_instances
 
+        # Distance guard: reject any candidate where pred_div_boxes is degenerate
+        # (all zeros) or farther than 4× the mother's box diagonal from the mother.
+        # This prevents the model from spawning D2 at some random distant location
+        # just because the division logit happened to fire on a poorly-predicting query.
+        m_boxes  = track_instances.pred_boxes[dividing_idxs]          # [K, 4] cxcywh
+        d2_boxes = track_instances.pred_div_boxes[dividing_idxs]       # [K, 4] cxcywh
+        m_diag   = (m_boxes[:, 2].pow(2) + m_boxes[:, 3].pow(2)).sqrt().clamp(min=1e-4)
+        d2_dist  = ((d2_boxes[:, 0] - m_boxes[:, 0]).pow(2) +
+                    (d2_boxes[:, 1] - m_boxes[:, 1]).pow(2)).sqrt()
+        d2_valid = (d2_boxes.abs().sum(dim=1) > 1e-4) & (d2_dist <= m_diag * 4.0)
+        dividing_idxs = dividing_idxs[d2_valid]
+
+        if len(dividing_idxs) == 0:
+            return track_instances
+
         mothers = track_instances[dividing_idxs]
         d2      = track_instances[dividing_idxs]   # copy — all fields from mother
 
@@ -660,8 +685,21 @@ class MOTR(nn.Module):
         d2.scores           = torch.ones_like(mothers.scores)
         d2.iou              = torch.ones_like(mothers.iou)
         d2.matched_gt_idxes = torch.full_like(mothers.matched_gt_idxes, -1)
-        d2.pred_div_score   = torch.full_like(mothers.pred_div_score, -5.0)
         d2.parent_obj_id    = mothers.obj_idxes.clone()
+        # Initialize D2 as a fresh spatial query anchored at the predicted D2 position.
+        # Cell-TRACTR has no QIM step and feeds hs_embed directly to the next decoder,
+        # so identical mother content works there.  In MOTRv2 the QIM self-attention
+        # computes q=k=pos2posemb(ref_pts)+out_embed; if D2 inherits the mother's
+        # out_embed and D2_ref ≈ D1_ref (early training), q_D1 ≈ q_D2 → they mix
+        # strongly → both daughters track D1's cell → D2 is killed by the tracker.
+        # Resetting all content-carrying fields makes D2 rely solely on its spatial
+        # ref_pts to find its cell, consistent between training and inference.
+        d2.output_embedding  = torch.zeros_like(mothers.output_embedding)
+        # query_pos must be 512-dim (= d_model); pos2posemb(4D, 128) → 4×128=512
+        _qd = self.query_embed.weight.shape[-1] // 4
+        d2.query_pos         = pos2posemb(d2.ref_pts, num_pos_feats=_qd)
+        d2.mem_bank          = torch.zeros_like(mothers.mem_bank)
+        d2.mem_padding_mask  = torch.ones_like(mothers.mem_padding_mask)  # True = no memory
 
         # D1: reset mother to unmatched high-confidence query, mirroring training.
         # track_base.update() will assign a fresh ID; QIM propagates via scores=1.0.
@@ -670,8 +708,6 @@ class MOTR(nn.Module):
         track_instances.iou[dividing_idxs]              = torch.ones_like(mothers.iou)
         track_instances.disappear_time[dividing_idxs]   = torch.zeros_like(mothers.disappear_time)
         track_instances.matched_gt_idxes[dividing_idxs] = torch.full_like(mothers.matched_gt_idxes, -1)
-        track_instances.pred_div_score[dividing_idxs]   = torch.full(
-            (len(dividing_idxs),), -5.0, device=track_instances.pred_div_score.device)
         track_instances.parent_obj_id[dividing_idxs]    = mothers.obj_idxes.clone()
 
         for pid in mothers.obj_idxes.tolist():
@@ -742,9 +778,11 @@ class MOTR(nn.Module):
             tmp = self.bbox_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp[..., :4] += reference
+                tmp[..., 4:6] += reference[..., :2]  # D2 center offset from same ref
             else:
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
+                tmp[..., 4:6] += reference
             outputs_coord = tmp.sigmoid()
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
@@ -756,7 +794,6 @@ class MOTR(nn.Module):
             # Aux outputs (intermediate layers) only need the first 4D for box matching/loss.
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord[..., :4])
         out['hs'] = hs[-1]
-        out['pred_div_score'] = self.div_score_embed(hs[-1]).squeeze(-1)
         return out
 
     def _forward_single_image_detector(self, samples, track_instances: Instances):
@@ -803,9 +840,11 @@ class MOTR(nn.Module):
             tmp = self.bbox_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp[..., :4] += reference
+                tmp[..., 4:6] += reference[..., :2]  # D2 center offset from same ref
             else:
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
+                tmp[..., 4:6] += reference
             outputs_coord = tmp.sigmoid()
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
@@ -863,9 +902,11 @@ class MOTR(nn.Module):
             tmp = self.bbox_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp[..., :4] += reference
+                tmp[..., 4:6] += reference[..., :2]  # D2 center offset from same ref
             else:
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
+                tmp[..., 4:6] += reference
             outputs_coord = tmp.sigmoid()
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
@@ -925,9 +966,11 @@ class MOTR(nn.Module):
             tmp = self.bbox_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp[..., :4] += reference
+                tmp[..., 4:6] += reference[..., :2]  # D2 center offset from same ref
             else:
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
+                tmp[..., 4:6] += reference
             outputs_coord = tmp.sigmoid()
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
@@ -987,9 +1030,11 @@ class MOTR(nn.Module):
             tmp = self.bbox_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp[..., :4] += reference
+                tmp[..., 4:6] += reference[..., :2]  # D2 center offset from same ref
             else:
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
+                tmp[..., 4:6] += reference
             outputs_coord = tmp.sigmoid()
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
@@ -1063,9 +1108,11 @@ class MOTR(nn.Module):
             tmp = self.bbox_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp[..., :4] += reference
+                tmp[..., 4:6] += reference[..., :2]  # D2 center offset from same ref
             else:
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
+                tmp[..., 4:6] += reference
             outputs_coord = tmp.sigmoid()
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
@@ -1077,7 +1124,6 @@ class MOTR(nn.Module):
             # Aux outputs (intermediate layers) only need the first 4D for box matching/loss.
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord[..., :4])
         out['hs'] = hs[-1]
-        out['pred_div_score'] = self.div_score_embed(hs[-1]).squeeze(-1)
         return out
 
     def _post_process_single_image(self, frame_res, track_instances, is_last):
@@ -1089,8 +1135,6 @@ class MOTR(nn.Module):
             frame_res['hs'] = frame_res['hs'][:, :n_ins]
             frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
             frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
-            if 'pred_div_score' in frame_res:
-                frame_res['pred_div_score'] = frame_res['pred_div_score'][:, :n_ins]
             ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
             for aux_outputs in frame_res['aux_outputs']:
                 ps_outputs.append({
@@ -1111,13 +1155,11 @@ class MOTR(nn.Module):
         track_instances.pred_boxes = frame_res['pred_boxes'][0, :, :4]
         track_instances.pred_div_boxes = frame_res['pred_boxes'][0, :, 4:]
         track_instances.output_embedding = frame_res['hs'][0]
-        if 'pred_div_score' in frame_res:
-            track_instances.pred_div_score = frame_res['pred_div_score'][0]
         if self.training:
             frame_res['track_instances'] = track_instances
             track_instances = self.criterion.match_for_single_frame(frame_res)
         else:
-            # Spawn daughter2 immediately for any active track with high pred_div_score.
+            # Spawn daughters for any active track whose division logit exceeds threshold.
             track_instances = self._spawn_daughter2_tracks(track_instances)
             self.track_base.update(track_instances)
         if self.memory_bank is not None:
@@ -1362,7 +1404,6 @@ class MOTR(nn.Module):
                         frame_res['pred_logits'],
                         frame_res['pred_boxes'],  # 8D: [:4]=d1, [4:]=d2
                         frame_res['hs'],
-                        frame_res['pred_div_score'],
                         *[aux['pred_logits'] for aux in frame_res['aux_outputs']],
                         *[aux['pred_boxes'] for aux in frame_res['aux_outputs']]
                     )
@@ -1374,15 +1415,14 @@ class MOTR(nn.Module):
                 ]
                 params = tuple((p for p in self.parameters() if p.requires_grad))
                 tmp = checkpointv2.CheckpointFunction.apply(fn, len(args), *args, *params)
-                num_aux = (len(tmp) - 4) // 2
+                num_aux = (len(tmp) - 3) // 2
                 frame_res = {
                     'pred_logits': tmp[0],
                     'pred_boxes': tmp[1],
                     'hs': tmp[2],
-                    'pred_div_score': tmp[3],
                     'aux_outputs': [{
-                        'pred_logits': tmp[4 + i],
-                        'pred_boxes': tmp[4 + num_aux + i],
+                        'pred_logits': tmp[3 + i],
+                        'pred_boxes': tmp[3 + num_aux + i],
                     } for i in range(num_aux)],
                 }
             else:
@@ -1498,7 +1538,6 @@ class MOTR(nn.Module):
                         frame_res['pred_logits'],
                         frame_res['pred_boxes'],  # 8D: [:4]=d1, [4:]=d2
                         frame_res['hs'],
-                        frame_res['pred_div_score'],
                         *[aux['pred_logits'] for aux in frame_res['aux_outputs']],
                         *[aux['pred_boxes'] for aux in frame_res['aux_outputs']]
                     )
@@ -1506,15 +1545,14 @@ class MOTR(nn.Module):
                 args = [frame, gtboxes] + [track_instances.get(k) for k in keys]
                 params = tuple((p for p in self.parameters() if p.requires_grad))
                 tmp = checkpointv2.CheckpointFunction.apply(fn, len(args), *args, *params)
-                num_aux = (len(tmp) - 4) // 2
+                num_aux = (len(tmp) - 3) // 2
                 frame_res = {
                     'pred_logits': tmp[0],
                     'pred_boxes': tmp[1],
                     'hs': tmp[2],
-                    'pred_div_score': tmp[3],
                     'aux_outputs': [{
-                        'pred_logits': tmp[4+i],
-                        'pred_boxes': tmp[4+num_aux+i],
+                        'pred_logits': tmp[3+i],
+                        'pred_boxes': tmp[3+num_aux+i],
                     } for i in range(num_aux)],
                 }
             else:
@@ -1573,7 +1611,6 @@ def build(args):
                             'frame_{}_loss_giou'.format(i): args.giou_loss_coef,
                             })
         if div_loss_coef > 0:
-            weight_dict["frame_{}_loss_div_score".format(i)] = div_loss_coef
             weight_dict["frame_{}_loss_div_box".format(i)]   = div_loss_coef
             weight_dict["frame_{}_loss_div_class".format(i)] = div_loss_coef
 

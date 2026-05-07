@@ -42,7 +42,7 @@ score_threshold: 0.3          # lowered from 0.4: cells scoring 0.35-0.45 were f
 update_score_threshold: 0.3   # same — controls when RuntimeTrackerBase assigns/kills IDs
 proposal_threshold: 0.05
 miss_tolerance: 5
-div_score_thresh: 0.4         # separate gate for division firing (pred_div_score head)
+div_score_thresh: 0.5         # pred_logits[:, 1].sigmoid() gate; 0.5 = natural BCE boundary (matches _FLEX_THRESH)
 
 # --- gap closing (post-processing) ---
 gap_close_frames: 5          # stitch tracks separated by up to this many frames
