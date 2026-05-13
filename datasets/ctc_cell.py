@@ -56,7 +56,7 @@ class CTCCellDataset:
 
     def __init__(self, args, image_set: str, transform):
         self.transform = transform
-        self.num_frames_per_batch = max(args.sampler_lengths)
+        self.num_frames_per_batch = max(args.sampler_lengths) + 1
         self.sample_mode = args.sample_mode
         self.sample_interval = args.sample_interval
         self.sampler_steps = args.sampler_steps
@@ -204,35 +204,94 @@ class CTCCellDataset:
               f"non-div clips: {len(self._nondiv_indices)}, "
               f"div_ratio={self.div_ratio}")
 
+        # Build birth-oversampled clips once; stored permanently so _rebuild_indices
+        # can re-append them every epoch (keeping dataset size stable for the sampler).
+        self._birth_indices: list = []
+        if image_set == 'train':
+            birth_oversample = getattr(args, 'birth_oversample', 0)
+            if birth_oversample > 0 and self.div_daughters:
+                self._birth_indices = self._compute_birth_indices(birth_oversample)
+
         self._rebuild_indices()
 
     # ------------------------------------------------------------------
     # Epoch / curriculum support
     # ------------------------------------------------------------------
 
+    def _compute_birth_indices(self, oversample: int) -> list:
+        """Return extra training clips pinned to daughters' birth frames.
+
+        Two clip variants per division event:
+          near — birth frame at clip position 1 (always sees T-1 and birth T)
+          far  — birth frame at end of max-window (longer run-up context)
+
+        Called once at __init__; result stored in self._birth_indices and
+        re-appended by _rebuild_indices every epoch so dataset size is stable.
+        """
+        max_frames = max(self.lengths) + 1
+        extra = []
+        n_events = 0
+
+        for seq_idx, (seq_key, img_ids) in enumerate(self.sequences):
+            n = len(img_ids)
+            frame_nb_to_pos: dict = {}
+            for pos, img_id in enumerate(img_ids):
+                img_meta = self.images[img_id]
+                frame_nb = int(re.findall(r'\d+', img_meta['file_name'])[-1])
+                frame_nb_to_pos[frame_nb] = pos
+
+            birth_positions: set = set()
+            for (sk, parent_id) in self.div_daughters:
+                if sk != seq_key:
+                    continue
+                for d_id in self.div_daughters[(sk, parent_id)]:
+                    birth_nb = self.daughter_first_frame.get((seq_key, d_id), -1)
+                    if birth_nb < 0:
+                        continue
+                    fp = frame_nb_to_pos.get(birth_nb, -1)
+                    if fp >= 0:
+                        birth_positions.add(fp)
+
+            for frame_pos in sorted(birth_positions):
+                n_events += 1
+                start_near = max(0, frame_pos - 1)
+                extra.extend([(seq_idx, start_near)] * oversample)
+                start_far = max(0, frame_pos - max_frames + 1)
+                if start_far != start_near and start_far + max_frames <= n:
+                    extra.extend([(seq_idx, start_far)] * max(1, oversample // 2))
+
+        print(f"  Birth oversampling ({oversample}×): {n_events} division birth frames "
+              f"→ +{len(extra)} extra clips")
+        return extra
+
     def _rebuild_indices(self):
         if self.div_ratio <= 0.0 or not self._div_indices:
             self.indices = self._nondiv_indices + self._div_indices
-            return
+        else:
+            rng   = np.random.default_rng(self.current_epoch)
+            total = len(self._div_indices) + len(self._nondiv_indices)
+            n_div = int(total * self.div_ratio)
+            n_non = total - n_div
 
-        rng   = np.random.default_rng(self.current_epoch)
-        total = len(self._div_indices) + len(self._nondiv_indices)
-        n_div = int(total * self.div_ratio)
-        n_non = total - n_div
+            replace_div = len(self._div_indices) < n_div
+            div_pick = rng.choice(len(self._div_indices), size=n_div,
+                                  replace=replace_div).tolist()
+            sampled_div = [self._div_indices[i] for i in div_pick]
 
-        replace_div = len(self._div_indices) < n_div
-        div_pick = rng.choice(len(self._div_indices), size=n_div,
-                              replace=replace_div).tolist()
-        sampled_div = [self._div_indices[i] for i in div_pick]
+            n_non = min(n_non, len(self._nondiv_indices))
+            non_pick = rng.choice(len(self._nondiv_indices), size=n_non,
+                                  replace=False).tolist()
+            sampled_non = [self._nondiv_indices[i] for i in non_pick]
 
-        n_non = min(n_non, len(self._nondiv_indices))
-        non_pick = rng.choice(len(self._nondiv_indices), size=n_non,
-                              replace=False).tolist()
-        sampled_non = [self._nondiv_indices[i] for i in non_pick]
+            combined = sampled_div + sampled_non
+            rng.shuffle(combined)
+            self.indices = [tuple(x) for x in combined]
 
-        combined = sampled_div + sampled_non
-        rng.shuffle(combined)
-        self.indices = [tuple(x) for x in combined]
+        # Always re-append birth-oversampled clips so dataset size is stable
+        # across epochs (required by DistributedSampler whose total_size is
+        # fixed at construction time).
+        if self._birth_indices:
+            self.indices = self.indices + self._birth_indices
 
     def set_epoch(self, epoch):
         self.current_epoch = epoch
@@ -241,7 +300,7 @@ class CTCCellDataset:
                 if epoch >= step:
                     self.period_idx = i + 1
             print(f"set epoch: epoch {epoch} period_idx={self.period_idx}")
-            self.num_frames_per_batch = self.lengths[self.period_idx]
+            self.num_frames_per_batch = self.lengths[self.period_idx] + 1
         self._rebuild_indices()
 
     def step_epoch(self):
@@ -352,7 +411,7 @@ class CTCCellDataset:
             'dataset': 'CTC_cell',
             'boxes': torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4),
             'labels': torch.as_tensor(labels, dtype=torch.long),
-            'obj_ids': torch.as_tensor(obj_ids, dtype=torch.float64),
+            'obj_ids': torch.as_tensor(obj_ids, dtype=torch.long),
             'div_flags': torch.as_tensor(div_flags, dtype=torch.float32),
             'div_ahead_flags': torch.as_tensor(div_ahead_flags, dtype=torch.float32),
             'div_box2': torch.stack(div_box2s) if div_box2s else torch.zeros(0, 4),

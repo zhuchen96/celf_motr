@@ -560,6 +560,8 @@ def build(args):
         num_classes = 1
     if args.dataset_file == 'e2e_cell':
         num_classes = 1
+    if args.dataset_file == 'e2e_cell_no_div':
+        num_classes = 1
     device = torch.device(args.device)
 
     backbone = build_backbone(args)

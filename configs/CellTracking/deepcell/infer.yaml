@@ -70,6 +70,9 @@ sampler_steps: ~
 
 # --- division prediction ---
 div_loss_coef: 1.0
+# MUST match training value — controls whether DivisionProposalMLP is built.
+# If 0 (or absent), the MLP is not instantiated and checkpoint weights are silently skipped.
+div_affinity_loss_coef: 1.0
 
 # --- runtime ---
 batch_size: 1

@@ -62,7 +62,7 @@ lr_backbone_names: ["backbone.0"]
 lr_linear_proj_names: ["reference_points", "sampling_offsets"]
 lr_linear_proj_mult: 0.1
 weight_decay: 1.0e-4
-clip_max_norm: 0.1
+clip_max_norm: 1.0
 sgd: false
 
 # --- schedule ---
@@ -89,15 +89,21 @@ aux_loss: true
 # div_loss_coef=2.0 keeps division at ~6% of total tracking loss while pos_weight
 # handles the internal class imbalance.
 div_loss_coef: 5.0
+# MLP affinity loss weight (division proposal affinity cross-entropy)
+div_affinity_loss_coef: 1.0
 
 # --- division-clip oversampling ---
 # 30% of clips are drawn from the division pool so the model sees dividing
 # cells often enough despite them being a small fraction of total frames.
 div_ratio: 0.3
 
+# Extra copies of clips where a daughter pair is born (position 1 = near,
+# end of max-window = far).  Additive on top of div_ratio rebalancing.
+birth_oversample: 5
+
 # --- self-proposal ---
 score_threshold: 0.05
-lambda_detect: 0.5
+lambda_detect: 1.0
 query_denoise: 0.05
 
 # --- training utilities ---

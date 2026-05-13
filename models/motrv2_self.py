@@ -33,11 +33,37 @@ from .qimv2 import build as build_query_interaction_layer
 from .deformable_detrv2 import SetCriterion, MLP, sigmoid_focal_loss
 
 
+class DivisionProposalMLP(nn.Module):
+    """Scores (mother_hs, proposal_hs) pairs for division proposal affinity.
+
+    For each dividing mother query, computes a scalar logit for every detection
+    proposal.  Trained with cross-entropy so the mother learns to attend to the
+    proposal that best overlaps GT daughter-2, bridging training and inference
+    (which picks the nearest proposal at division time).
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(self, mother_hs: Tensor, proposal_hs: Tensor) -> Tensor:
+        """mother_hs: [K, d], proposal_hs: [N, d] → logits [K, N]"""
+        K, d = mother_hs.shape
+        N = proposal_hs.shape[0]
+        m = mother_hs.unsqueeze(1).expand(K, N, d)
+        p = proposal_hs.unsqueeze(0).expand(K, N, d)
+        return self.net(torch.cat([m, p], dim=-1)).squeeze(-1)
+
+
 class ClipMatcher(SetCriterion):
     def __init__(self, num_classes,
                         matcher,
                         weight_dict,
-                        losses):
+                        losses,
+                        div_proposal_mlp=None):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -45,6 +71,7 @@ class ClipMatcher(SetCriterion):
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
+            div_proposal_mlp: optional DivisionProposalMLP for affinity loss
         """
         super().__init__(num_classes, matcher, weight_dict, losses)
         self.num_classes = num_classes
@@ -54,6 +81,10 @@ class ClipMatcher(SetCriterion):
         self.focal_loss = True
         self.losses_dict = {}
         self._current_frame_idx = 0
+        # Store as a plain attribute (not an nn.Module child) so this criterion does
+        # not double-register the MLP.  The MLP is owned by the MOTR model and is
+        # included in model.parameters() / model.state_dict() from there.
+        object.__setattr__(self, 'div_proposal_mlp', div_proposal_mlp)
 
     def initialize_for_single_clip(self, gt_instances: List[Instances]):
         self.gt_instances = gt_instances
@@ -176,6 +207,9 @@ class ClipMatcher(SetCriterion):
 
     def match_for_single_frame(self, outputs: dict):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        n_proposals    = outputs_without_aux.get('n_proposals', 0)
+        proposal_start = outputs_without_aux.get('proposal_start', 0)
+        proposal_end   = outputs_without_aux.get('proposal_end', proposal_start + n_proposals)
 
         gt_instances_i = self.gt_instances[self._current_frame_idx]  # gt instances of i-th image.
         track_instances: Instances = outputs_without_aux['track_instances']
@@ -352,7 +386,10 @@ class ClipMatcher(SetCriterion):
                         'frame_{}_loss_div_class'.format(self._current_frame_idx)
                     ] = loss_div_class
 
-                # Daughter2-box regression loss (L1, only at flex_div_flags=1 frames)
+                # Daughter2-box regression loss (L1, only at flex_div_flags=1 frames).
+                # When a decoded proposal overlaps GT D2 with IoU > 0.3, snap the
+                # regression target to that proposal box — this aligns training with
+                # inference, which spawns D2 at the nearest proposal position.
                 if gt_instances_i.has('div_box2') and track_instances.has('pred_div_boxes'):
                     div_cell_mask = flex_div_flags > 0.5
                     if div_cell_mask.sum() > 0:
@@ -361,7 +398,19 @@ class ClipMatcher(SetCriterion):
                                 gt_instances_i.div_box2[tgt_idx[div_cell_mask]].to(pred_db)
                         valid_db = gt_db.abs().sum(dim=1) > 1e-6
                         if valid_db.sum() > 0:
-                            loss_div_box = F.l1_loss(pred_db[valid_db], gt_db[valid_db])
+                            reg_target = gt_db[valid_db]
+                            if n_proposals > 0:
+                                prop_boxes = track_instances.pred_boxes[proposal_start:proposal_end].detach()
+                                iou_snap = pairwise_iou(
+                                    Boxes(box_ops.box_cxcywh_to_xyxy(reg_target)),
+                                    Boxes(box_ops.box_cxcywh_to_xyxy(prop_boxes)),
+                                )  # [M, N_proposals]
+                                best_iou_s, best_idx_s = iou_snap.max(dim=1)
+                                snap_ok = best_iou_s > 0.3
+                                if snap_ok.any():
+                                    reg_target = reg_target.clone()
+                                    reg_target[snap_ok] = prop_boxes[best_idx_s[snap_ok]]
+                            loss_div_box = F.l1_loss(pred_db[valid_db], reg_target)
                         else:
                             loss_div_box = track_instances.pred_div_boxes.sum() * 0.0
                     else:
@@ -369,6 +418,35 @@ class ClipMatcher(SetCriterion):
                     self.losses_dict[
                         'frame_{}_loss_div_box'.format(self._current_frame_idx)
                     ] = loss_div_box
+
+                # Division proposal affinity loss.
+                # For each dividing mother, the MLP scores cat(mother_hs, proposal_hs[j])
+                # for every detection proposal j.  Cross-entropy supervises it to point at
+                # the proposal that best overlaps GT daughter-2 (IoU > 0.3 required).
+                if (self.div_proposal_mlp is not None and n_proposals > 0 and
+                        gt_instances_i.has('div_box2')):
+                    div_cell_mask = flex_div_flags > 0.5
+                    if div_cell_mask.sum() > 0:
+                        mother_src = src_idx[div_cell_mask]
+                        gt_d2 = (flex_div_box2s[div_cell_mask] if flex_div_box2s is not None else
+                                 gt_instances_i.div_box2[tgt_idx[div_cell_mask]].to(pred_logits_i))
+                        valid_d2 = gt_d2.abs().sum(dim=1) > 1e-6
+                        if valid_d2.sum() > 0:
+                            prop_boxes = track_instances.pred_boxes[proposal_start:proposal_end].detach()
+                            iou_aff = pairwise_iou(
+                                Boxes(box_ops.box_cxcywh_to_xyxy(gt_d2[valid_d2])),
+                                Boxes(box_ops.box_cxcywh_to_xyxy(prop_boxes)),
+                            )  # [K_valid, N_proposals]
+                            best_iou_a, best_prop_a = iou_aff.max(dim=1)
+                            aff_ok = best_iou_a > 0.3
+                            if aff_ok.sum() > 0:
+                                m_hs = track_instances.output_embedding[mother_src[valid_d2][aff_ok]]
+                                p_hs = track_instances.output_embedding[proposal_start:proposal_end]
+                                logits_aff = self.div_proposal_mlp(m_hs, p_hs)  # [K_aff, N]
+                                loss_div_affinity = F.cross_entropy(logits_aff, best_prop_a[aff_ok])
+                                self.losses_dict[
+                                    'frame_{}_loss_div_affinity'.format(self._current_frame_idx)
+                                ] = loss_div_affinity
 
                 # Training-time D2 spawning (teacher-forced at flex_div frames).
                 if gt_instances_i.has('div_box2'):
@@ -381,7 +459,19 @@ class ClipMatcher(SetCriterion):
                             div_src = src_idx[d2_mask][valid_d2]
                             mothers = track_instances[div_src]
                             d2      = track_instances[div_src]
-                            d2_pos  = gt_d2[valid_d2]
+                            d2_pos  = gt_d2[valid_d2].clone()
+                            # Snap D2 spawn to nearest proposal (IoU > 0.3) so the
+                            # starting position matches what inference does via the MLP.
+                            if n_proposals > 0:
+                                spawn_prop = track_instances.pred_boxes[proposal_start:proposal_end].detach()
+                                iou_spawn = pairwise_iou(
+                                    Boxes(box_ops.box_cxcywh_to_xyxy(d2_pos)),
+                                    Boxes(box_ops.box_cxcywh_to_xyxy(spawn_prop)),
+                                )  # [M, N_proposals]
+                                best_iou_sp, best_idx_sp = iou_spawn.max(dim=1)
+                                spawn_ok = best_iou_sp > 0.3
+                                if spawn_ok.any():
+                                    d2_pos[spawn_ok] = spawn_prop[best_idx_sp[spawn_ok]]
                             d2.ref_pts    = d2_pos.clone()
                             d2.pred_boxes = d2_pos.clone()
                             d2.scores           = torch.ones_like(mothers.scores)
@@ -412,6 +502,18 @@ class ClipMatcher(SetCriterion):
                     self.losses_dict[
                         'frame_{}_loss_div_class'.format(self._current_frame_idx)
                     ] = pred_logits_i[:, self.num_classes].sum() * 0.0
+
+        # reduce_dict (called in the engine) does a single NCCL allreduce on a
+        # stacked tensor of ALL loss values.  Every rank must have exactly the
+        # same keys.  loss_div_affinity is only written above when aff_ok fires,
+        # which differs per rank/batch → size mismatch → NCCL deadlock.
+        # Always write a zero-valued (but graph-connected) entry as fallback.
+        if self.div_proposal_mlp is not None:
+            key = 'frame_{}_loss_div_affinity'.format(self._current_frame_idx)
+            if key not in self.losses_dict:
+                self.losses_dict[key] = sum(
+                    p.sum() * 0.0 for p in self.div_proposal_mlp.parameters()
+                )
 
         self._step()
         return track_instances
@@ -494,7 +596,7 @@ def _get_clones(module, N):
 class MOTR(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_queries_detect, num_feature_levels, criterion, track_embed,
                  aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False, query_denoise=0,
-                 div_score_thresh=0.4):
+                 div_score_thresh=0.4, div_proposal_mlp=None):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -592,6 +694,10 @@ class MOTR(nn.Module):
         self.track_base = RuntimeTrackerBase()
         self.div_score_thresh = div_score_thresh
         self.criterion = criterion
+        # Registered as a model submodule so its weights appear in model.parameters()
+        # and model.state_dict() — critical for optimizer updates and checkpoint I/O.
+        # ClipMatcher holds only a non-owning reference (via object.__setattr__).
+        self.div_proposal_mlp = div_proposal_mlp  # nn.Module or None
         self.memory_bank = memory_bank
         self.mem_bank_len = 0 if memory_bank is None else memory_bank.max_his_length
 
@@ -630,10 +736,16 @@ class MOTR(nn.Module):
         self.track_base.clear()
         self.division_log: list = []
 
-    def _spawn_daughter2_tracks(self, track_instances: Instances) -> Instances:
-        """At the division frame: for any active track whose pred_logits[:, 1] (division
-        class logit) exceeds div_score_thresh, spawn D1 (reset mother) and D2 (new query).
-        RuntimeTrackerBase will assign new IDs to both after this call."""
+    def _spawn_daughter2_tracks(self, track_instances: Instances,
+                                n_proposals: int = 0,
+                                proposal_start: int = 0,
+                                proposal_end: int = 0) -> Instances:
+        """At the division frame: for any active track whose division logit exceeds
+        div_score_thresh, spawn D1 (reset mother) and D2 (new query).
+
+        When DivisionProposalMLP is available and proposals are present, D2 is placed
+        at the proposal selected by the MLP (matching the affinity loss used at training).
+        Otherwise falls back to pred_div_boxes."""
         if not track_instances.has('pred_div_boxes'):
             return track_instances
 
@@ -659,50 +771,63 @@ class MOTR(nn.Module):
         if len(dividing_idxs) == 0:
             return track_instances
 
-        # Distance guard: reject any candidate where pred_div_boxes is degenerate
-        # (all zeros) or farther than 4× the mother's box diagonal from the mother.
-        # This prevents the model from spawning D2 at some random distant location
-        # just because the division logit happened to fire on a poorly-predicting query.
-        m_boxes  = track_instances.pred_boxes[dividing_idxs]          # [K, 4] cxcywh
-        d2_boxes = track_instances.pred_div_boxes[dividing_idxs]       # [K, 4] cxcywh
+        # --- D2 position: MLP-selected proposal or pred_div_boxes fallback ---
+        # The validity guard differs by path: when the MLP selects a proposal we
+        # validate the selected proposal box; when falling back to pred_div_boxes
+        # we validate pred_div_boxes.  Mixing the two (guarding on pred_div_boxes
+        # then overriding with a proposal) would wrongly reject valid divisions.
+        _mlp     = self.div_proposal_mlp  # registered on model; None when not configured
+        use_mlp  = _mlp is not None and n_proposals > 0 and proposal_end > proposal_start
+        m_boxes  = track_instances.pred_boxes[dividing_idxs]  # [K, 4] cxcywh
         m_diag   = (m_boxes[:, 2].pow(2) + m_boxes[:, 3].pow(2)).sqrt().clamp(min=1e-4)
-        d2_dist  = ((d2_boxes[:, 0] - m_boxes[:, 0]).pow(2) +
-                    (d2_boxes[:, 1] - m_boxes[:, 1]).pow(2)).sqrt()
-        d2_valid = (d2_boxes.abs().sum(dim=1) > 1e-4) & (d2_dist <= m_diag * 4.0)
-        dividing_idxs = dividing_idxs[d2_valid]
 
-        if len(dividing_idxs) == 0:
-            return track_instances
+        if use_mlp:
+            prop_hs    = track_instances.output_embedding[proposal_start:proposal_end]  # [N, d]
+            mother_hs  = track_instances.output_embedding[dividing_idxs]               # [K, d]
+            logits_aff = _mlp(mother_hs, prop_hs)                                      # [K, N]
+            best_local = logits_aff.argmax(dim=1)                                      # [K] ∈ [0, N)
+            prop_boxes = track_instances.pred_boxes[proposal_start:proposal_end]       # [N, 4]
+            sel_boxes  = prop_boxes[best_local]                                        # [K, 4]
+            sel_dist   = ((sel_boxes[:, 0] - m_boxes[:, 0]).pow(2) +
+                          (sel_boxes[:, 1] - m_boxes[:, 1]).pow(2)).sqrt()
+            d2_valid      = (sel_boxes.abs().sum(dim=1) > 1e-4) & (sel_dist <= m_diag * 4.0)
+            dividing_idxs = dividing_idxs[d2_valid]
+            best_local    = best_local[d2_valid]
+            if len(dividing_idxs) == 0:
+                return track_instances
+            selected_global = proposal_start + best_local      # global indices into track_instances
+            d2_pos = track_instances.pred_boxes[selected_global].clone()
+        else:
+            d2_boxes = track_instances.pred_div_boxes[dividing_idxs]  # [K, 4]
+            d2_dist  = ((d2_boxes[:, 0] - m_boxes[:, 0]).pow(2) +
+                        (d2_boxes[:, 1] - m_boxes[:, 1]).pow(2)).sqrt()
+            d2_valid      = (d2_boxes.abs().sum(dim=1) > 1e-4) & (d2_dist <= m_diag * 4.0)
+            dividing_idxs = dividing_idxs[d2_valid]
+            if len(dividing_idxs) == 0:
+                return track_instances
+            selected_global = None
+            d2_pos = track_instances.pred_div_boxes[dividing_idxs].clone()
 
         mothers = track_instances[dividing_idxs]
         d2      = track_instances[dividing_idxs]   # copy — all fields from mother
-
-        # D2 starts at predicted daughter2 position.
-        d2.ref_pts          = mothers.pred_div_boxes.clone()
-        d2.pred_boxes       = mothers.pred_div_boxes.clone()
+        d2.ref_pts    = d2_pos
+        d2.pred_boxes = d2_pos
         d2.obj_idxes        = torch.full_like(mothers.obj_idxes, -1)
         d2.disappear_time   = torch.zeros_like(mothers.disappear_time)
         d2.scores           = torch.ones_like(mothers.scores)
         d2.iou              = torch.ones_like(mothers.iou)
         d2.matched_gt_idxes = torch.full_like(mothers.matched_gt_idxes, -1)
         d2.parent_obj_id    = mothers.obj_idxes.clone()
-        # Initialize D2 as a fresh spatial query anchored at the predicted D2 position.
-        # Cell-TRACTR has no QIM step and feeds hs_embed directly to the next decoder,
-        # so identical mother content works there.  In MOTRv2 the QIM self-attention
-        # computes q=k=pos2posemb(ref_pts)+out_embed; if D2 inherits the mother's
-        # out_embed and D2_ref ≈ D1_ref (early training), q_D1 ≈ q_D2 → they mix
-        # strongly → both daughters track D1's cell → D2 is killed by the tracker.
-        # Resetting all content-carrying fields makes D2 rely solely on its spatial
-        # ref_pts to find its cell, consistent between training and inference.
+        # D2 starts as a fresh spatial query: zero content forces it to rely on
+        # ref_pts alone, preventing D2 from inheriting D1's QIM key and collapsing
+        # onto D1 in the next decoder step.
         d2.output_embedding  = torch.zeros_like(mothers.output_embedding)
-        # query_pos must be 512-dim (= d_model); pos2posemb(4D, 128) → 4×128=512
         _qd = self.query_embed.weight.shape[-1] // 4
         d2.query_pos         = pos2posemb(d2.ref_pts, num_pos_feats=_qd)
         d2.mem_bank          = torch.zeros_like(mothers.mem_bank)
         d2.mem_padding_mask  = torch.ones_like(mothers.mem_padding_mask)  # True = no memory
 
-        # D1: reset mother to unmatched high-confidence query, mirroring training.
-        # track_base.update() will assign a fresh ID; QIM propagates via scores=1.0.
+        # D1: reset mother to unmatched high-confidence query.
         track_instances.obj_idxes[dividing_idxs]        = -1
         track_instances.scores[dividing_idxs]           = torch.ones_like(mothers.scores)
         track_instances.iou[dividing_idxs]              = torch.ones_like(mothers.iou)
@@ -713,7 +838,15 @@ class MOTR(nn.Module):
         for pid in mothers.obj_idxes.tolist():
             self.division_log.append({'parent_id': int(pid), 'd1_id': None, 'd2_id': None})
 
-        return Instances.cat([track_instances, d2])
+        track_instances = Instances.cat([track_instances, d2])
+
+        # Suppress the adopted proposal so RuntimeTrackerBase does not assign it
+        # a second new ID alongside the D2 query we just spawned from it.
+        if selected_global is not None:
+            track_instances.scores[selected_global]    = 0.0
+            track_instances.obj_idxes[selected_global] = -2  # -2 = explicit FP, excluded by tracker
+
+        return track_instances
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
@@ -1160,7 +1293,10 @@ class MOTR(nn.Module):
             track_instances = self.criterion.match_for_single_frame(frame_res)
         else:
             # Spawn daughters for any active track whose division logit exceeds threshold.
-            track_instances = self._spawn_daughter2_tracks(track_instances)
+            n_prop = frame_res.get('n_proposals', 0)
+            p_start = frame_res.get('proposal_start', self.num_queries)
+            p_end   = frame_res.get('proposal_end', p_start + n_prop)
+            track_instances = self._spawn_daughter2_tracks(track_instances, n_prop, p_start, p_end)
             self.track_base.update(track_instances)
         if self.memory_bank is not None:
             track_instances = self.memory_bank(track_instances)
@@ -1185,6 +1321,9 @@ class MOTR(nn.Module):
                 track_instances])
         res = self._forward_single_image(img,
                                          track_instances=track_instances)
+        res['n_proposals']    = len(proposals) if proposals is not None else 0
+        res['proposal_start'] = self.num_queries
+        res['proposal_end']   = self.num_queries + res['n_proposals']
         res = self._post_process_single_image(res, track_instances, False)
 
         track_instances = res['track_instances']
@@ -1209,6 +1348,9 @@ class MOTR(nn.Module):
                 self._generate_empty_tracks(proposals),
                 track_instances])
         res = self._forward_single_image_light(img, track_instances, memory, spatial_shapes, level_start_index, valid_ratios, mask_flatten)
+        res['n_proposals']    = len(proposals) if proposals is not None else 0
+        res['proposal_start'] = self.num_queries
+        res['proposal_end']   = self.num_queries + res['n_proposals']
         res = self._post_process_single_image(res, track_instances, False)
 
         track_instances = res['track_instances']
@@ -1435,6 +1577,9 @@ class MOTR(nn.Module):
                     cache['mask_flatten'],
                     gtboxes
                 )
+            frame_res['n_proposals']    = len(proposals) if proposals is not None else 0
+            frame_res['proposal_start'] = self.num_queries
+            frame_res['proposal_end']   = self.num_queries + frame_res['n_proposals']
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last)
 
             track_instances = frame_res['track_instances']
@@ -1558,6 +1703,9 @@ class MOTR(nn.Module):
             else:
                 frame = nested_tensor_from_tensor_list([frame])
                 frame_res = self._forward_single_image(frame, track_instances, gtboxes)
+            frame_res['n_proposals']    = len(proposals) if proposals is not None else 0
+            frame_res['proposal_start'] = self.num_queries
+            frame_res['proposal_end']   = self.num_queries + frame_res['n_proposals']
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last)
 
             track_instances = frame_res['track_instances']
@@ -1604,6 +1752,7 @@ def build(args):
     # so the model sees daughters after a division event.
     num_frames_per_batch = max(args.sampler_lengths) + 1
     div_loss_coef = getattr(args, 'div_loss_coef', 0.0)
+    div_affinity_loss_coef = getattr(args, 'div_affinity_loss_coef', 0.0)
     weight_dict = {}
     for i in range(num_frames_per_batch):
         weight_dict.update({"frame_{}_loss_ce".format(i): args.cls_loss_coef,
@@ -1613,6 +1762,8 @@ def build(args):
         if div_loss_coef > 0:
             weight_dict["frame_{}_loss_div_box".format(i)]   = div_loss_coef
             weight_dict["frame_{}_loss_div_class".format(i)] = div_loss_coef
+        if div_affinity_loss_coef > 0:
+            weight_dict["frame_{}_loss_div_affinity".format(i)] = div_affinity_loss_coef
 
     # TODO this is a hack
     if args.aux_loss:
@@ -1634,7 +1785,12 @@ def build(args):
     else:
         memory_bank = None
     losses = ['labels', 'boxes']
-    criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses)
+    # Create the MLP before model/criterion so the same object can be registered
+    # as a model submodule (for optimizer + checkpoint) while criterion holds only
+    # a non-owning reference (via object.__setattr__).
+    div_proposal_mlp = DivisionProposalMLP(d_model) if div_affinity_loss_coef > 0 else None
+    criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses,
+                            div_proposal_mlp=div_proposal_mlp)
     criterion.to(device)
     postprocessors = {}
     model = MOTR(
@@ -1653,5 +1809,6 @@ def build(args):
         use_checkpoint=args.use_checkpoint,
         query_denoise=args.query_denoise,
         div_score_thresh=getattr(args, 'div_score_thresh', 0.4),
+        div_proposal_mlp=div_proposal_mlp,
     )
     return model, criterion, postprocessors

@@ -1,0 +1,89 @@
+# ============================================================
+# SelfMOTR — DeepCell — Division Score Diagnostic Config
+# ============================================================
+
+# --- paths ---
+mot_path: /srv/home/chen/Cell-TRACTR/data/deepcell/COCO
+output_dir: /srv/home/chen/cell_motr/self/outputs/cell_deepcell_no_div_eval
+resume: /srv/home/chen/cell_motr/self/outputs/cell_deepcell_no_div/checkpoint.pth
+
+# --- dataset ---
+dataset_file: e2e_cell_no_div
+meta_arch: motrv2_self_no_div
+
+# --- model (must match training config exactly) ---
+backbone: resnet50
+num_feature_levels: 4
+enc_layers: 6
+dec_layers: 6
+dim_feedforward: 1024
+hidden_dim: 256
+nheads: 8
+dec_n_points: 4
+enc_n_points: 4
+num_anchors: 1
+with_box_refine: true
+two_stage: false
+shared_decoder: true
+
+# --- queries (must match training) ---
+num_queries: 300
+num_queries_detect: 500
+
+# --- query interaction (must match training) ---
+query_interaction_layer: QIMv2
+random_drop: 0.0
+fp_ratio: 0.0
+merger_dropout: 0.0
+dropout: 0.0
+
+# --- inference thresholds (same as infer_no_div.yaml) ---
+score_threshold: 0.3
+update_score_threshold: 0.15
+proposal_threshold: 0.02
+miss_tolerance: 5
+
+# --- split ---
+split: val
+
+# --- encoder cache reuse ---
+reuse_encoder_cache: true
+
+# --- diagnostic settings ---
+window: 8
+out_csv: /srv/home/chen/cell_motr/self/outputs/diag_division_scores.csv
+
+# --- sampling (only affects dataloader, not inference) ---
+sample_mode: fixed_interval
+sample_interval: 1
+sampler_lengths: [1]
+sampler_steps: ~
+
+# --- runtime ---
+batch_size: 1
+num_workers: 2
+device: cuda
+seed: 42
+
+# --- unused / keep defaults ---
+aux_loss: true
+cls_loss_coef: 2.0
+bbox_loss_coef: 5.0
+giou_loss_coef: 2.0
+set_cost_class: 2.0
+set_cost_bbox: 5.0
+set_cost_giou: 2.0
+focal_alpha: 0.25
+mask_loss_coef: 1.0
+dice_loss_coef: 1.0
+memory_bank_type: ~
+memory_bank_score_thresh: 0.0
+memory_bank_len: 4
+memory_bank_with_self_attn: false
+use_checkpoint: false
+accum_iter: 1
+query_denoise: 0.0
+lambda_detect: 0.5
+div_loss_coef: 0.0
+gap_close_frames: 5
+gap_close_dist_factor: 1.5
