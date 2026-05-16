@@ -62,7 +62,7 @@ lr_backbone_names: ["backbone.0"]
 lr_linear_proj_names: ["reference_points", "sampling_offsets"]
 lr_linear_proj_mult: 0.1
 weight_decay: 1.0e-4
-clip_max_norm: 1.0
+clip_max_norm: 0.5
 sgd: false
 
 # --- schedule ---
@@ -82,13 +82,13 @@ aux_loss: true
 
 # --- division prediction ---
 # man_track/ files are present for all 91 train sequences.
-# pos_weight=20 (hardcoded in loss) handles the ~2-5% positive rate within BCE.
+# pos_weight=5 (hardcoded in loss) handles the ~2-5% positive rate within BCE.
 # div_loss_coef scales the whole division loss relative to tracking loss.
-# Do NOT stack a large div_loss_coef with the already-large pos_weight:
-#   pos_weight=20 × div_loss_coef=20 → 400× gradient on dividing cells → instability.
-# div_loss_coef=2.0 keeps division at ~6% of total tracking loss while pos_weight
-# handles the internal class imbalance.
-div_loss_coef: 5.0
+# loss_div_class now uses reduction='mean' (not 'sum'), so the loss no longer scales
+# with K (number of matched tracks). The effective per-event gradient is:
+#   pos_weight × div_loss_coef / K × BCE ≈ 5 × 10 / 70 × BCE ≈ 0.71 × BCE
+# This is stable through curriculum switches (longer clips don't inflate the loss).
+div_loss_coef: 10.0
 # MLP affinity loss weight (division proposal affinity cross-entropy)
 div_affinity_loss_coef: 1.0
 
@@ -99,7 +99,10 @@ div_ratio: 0.3
 
 # Extra copies of clips where a daughter pair is born (position 1 = near,
 # end of max-window = far).  Additive on top of div_ratio rebalancing.
-birth_oversample: 5
+# Set to 0: even birth_oversample=2 created enough gradient variance to cause
+# catastrophic drift (epoch-22 divergence). div_ratio=0.3 already ensures
+# sufficient exposure to division events without per-event cluster amplification.
+birth_oversample: 0
 
 # --- self-proposal ---
 score_threshold: 0.05

@@ -239,8 +239,13 @@ def main():
     d2  = sum(e['d2_detected'] for e in all_events)
     both= sum(e['d1_detected'] and e['d2_detected'] for e in all_events)
 
-    d1_link = sum(e['d1_has_parent_link'] for e in all_events if e['d1_detected'])
-    d2_link = sum(e['d2_has_parent_link'] for e in all_events if e['d2_detected'])
+    d1_link   = sum(e['d1_has_parent_link'] for e in all_events if e['d1_detected'])
+    d2_link   = sum(e['d2_has_parent_link'] for e in all_events if e['d2_detected'])
+    both_link = sum(
+        e['d1_detected'] and e['d2_detected'] and
+        e['d1_has_parent_link'] and e['d2_has_parent_link']
+        for e in all_events
+    )
 
     d1_lens = [e['d1_track_len'] for e in all_events if e['d1_track_len'] is not None]
     d2_lens = [e['d2_track_len'] for e in all_events if e['d2_track_len'] is not None]
@@ -255,6 +260,7 @@ def main():
         print(f"  D1 has parent link  : {d1_link}/{d1}  ({100*d1_link/d1:.1f}%)")
     if d2 > 0:
         print(f"  D2 has parent link  : {d2_link}/{d2}  ({100*d2_link/d2:.1f}%)")
+    print(f"  Both linked         : {both_link}/{n}  ({100*both_link/n:.1f}%)")
     if d1_lens:
         print(f"  D1 median track len : {np.median(d1_lens):.0f} frames")
     if d2_lens:

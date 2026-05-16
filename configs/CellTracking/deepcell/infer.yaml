@@ -38,8 +38,13 @@ merger_dropout: 0.0
 dropout: 0.0
 
 # --- inference thresholds ---
-score_threshold: 0.3          # lowered from 0.4: cells scoring 0.35-0.45 were fragmenting
-update_score_threshold: 0.3   # same — controls when RuntimeTrackerBase assigns/kills IDs
+# score_threshold gates which detected tracks are shown in the output.
+# update_score_threshold controls when RuntimeTrackerBase activates / kills IDs.
+# Both should be equal in practice; lower values improve recall at cost of more FP.
+# At epoch 12/50 the model is still learning — 0.15 trades some precision for recall.
+# Raise back toward 0.3–0.4 as training matures.
+score_threshold: 0.15
+update_score_threshold: 0.15
 proposal_threshold: 0.05
 miss_tolerance: 5
 div_score_thresh: 0.5         # pred_logits[:, 1].sigmoid() gate; 0.5 = natural BCE boundary (matches _FLEX_THRESH)
@@ -70,8 +75,8 @@ sampler_steps: ~
 
 # --- division prediction ---
 div_loss_coef: 1.0
-# MUST match training value — controls whether DivisionProposalMLP is built.
-# If 0 (or absent), the MLP is not instantiated and checkpoint weights are silently skipped.
+# MUST match training value — controls whether both DivisionProposalMLPs are built.
+# If 0 (or absent), neither MLP is instantiated and checkpoint weights are silently skipped.
 div_affinity_loss_coef: 1.0
 
 # --- runtime ---

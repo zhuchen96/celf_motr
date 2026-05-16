@@ -71,7 +71,7 @@ class ClipMatcher(SetCriterion):
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
-            div_proposal_mlp: optional DivisionProposalMLP for affinity loss
+            div_proposal_mlp: optional DivisionProposalMLP for affinity loss (both daughters)
         """
         super().__init__(num_classes, matcher, weight_dict, losses)
         self.num_classes = num_classes
@@ -379,9 +379,10 @@ class ClipMatcher(SetCriterion):
                 # primary division signal.  pos_weight handles ~2-5% positive rate.
                 if pred_logits_i.shape[-1] > self.num_classes:
                     pred_div_logit = pred_logits_i[src_idx, self.num_classes]
-                    pos_weight_cls = torch.tensor(20.0, device=pred_div_logit.device)
+                    pos_weight_cls = torch.tensor(5.0, device=pred_div_logit.device)
                     loss_div_class = F.binary_cross_entropy_with_logits(
-                        pred_div_logit, flex_div_flags, pos_weight=pos_weight_cls)
+                        pred_div_logit, flex_div_flags, pos_weight=pos_weight_cls,
+                        reduction='mean')
                     self.losses_dict[
                         'frame_{}_loss_div_class'.format(self._current_frame_idx)
                     ] = loss_div_class
@@ -410,7 +411,7 @@ class ClipMatcher(SetCriterion):
                                 if snap_ok.any():
                                     reg_target = reg_target.clone()
                                     reg_target[snap_ok] = prop_boxes[best_idx_s[snap_ok]]
-                            loss_div_box = F.l1_loss(pred_db[valid_db], reg_target)
+                            loss_div_box = F.l1_loss(pred_db[valid_db], reg_target, reduction='mean')
                         else:
                             loss_div_box = track_instances.pred_div_boxes.sum() * 0.0
                     else:
@@ -419,10 +420,12 @@ class ClipMatcher(SetCriterion):
                         'frame_{}_loss_div_box'.format(self._current_frame_idx)
                     ] = loss_div_box
 
-                # Division proposal affinity loss.
-                # For each dividing mother, the MLP scores cat(mother_hs, proposal_hs[j])
-                # for every detection proposal j.  Cross-entropy supervises it to point at
-                # the proposal that best overlaps GT daughter-2 (IoU > 0.3 required).
+                # Division proposal affinity loss (single MLP, both daughters as positives).
+                # The MLP scores cat(mother_hs, proposal_hs[j]) for every proposal j.
+                # GT D1 (main box of merged entry) and GT D2 (div_box2) are both marked
+                # as positives in a binary cross-entropy target — the network learns
+                # "how daughter-like is this proposal" without distinguishing D1 from D2.
+                # At inference the top-2 proposals become D1 and D2.
                 if (self.div_proposal_mlp is not None and n_proposals > 0 and
                         gt_instances_i.has('div_box2')):
                     div_cell_mask = flex_div_flags > 0.5
@@ -430,23 +433,74 @@ class ClipMatcher(SetCriterion):
                         mother_src = src_idx[div_cell_mask]
                         gt_d2 = (flex_div_box2s[div_cell_mask] if flex_div_box2s is not None else
                                  gt_instances_i.div_box2[tgt_idx[div_cell_mask]].to(pred_logits_i))
-                        valid_d2 = gt_d2.abs().sum(dim=1) > 1e-6
-                        if valid_d2.sum() > 0:
+                        gt_d1 = gt_instances_i.boxes[tgt_idx[div_cell_mask]].to(pred_logits_i)
+                        valid = (gt_d2.abs().sum(dim=1) > 1e-6) & (gt_d1.abs().sum(dim=1) > 1e-6)
+                        if valid.sum() > 0:
                             prop_boxes = track_instances.pred_boxes[proposal_start:proposal_end].detach()
-                            iou_aff = pairwise_iou(
-                                Boxes(box_ops.box_cxcywh_to_xyxy(gt_d2[valid_d2])),
+                            iou_d1 = pairwise_iou(
+                                Boxes(box_ops.box_cxcywh_to_xyxy(gt_d1[valid])),
                                 Boxes(box_ops.box_cxcywh_to_xyxy(prop_boxes)),
                             )  # [K_valid, N_proposals]
-                            best_iou_a, best_prop_a = iou_aff.max(dim=1)
-                            aff_ok = best_iou_a > 0.3
+                            iou_d2 = pairwise_iou(
+                                Boxes(box_ops.box_cxcywh_to_xyxy(gt_d2[valid])),
+                                Boxes(box_ops.box_cxcywh_to_xyxy(prop_boxes)),
+                            )  # [K_valid, N_proposals]
+                            best_iou_d1, best_idx_d1 = iou_d1.max(dim=1)
+                            best_iou_d2, best_idx_d2 = iou_d2.max(dim=1)
+                            # Both daughters must have a matching proposal (IoU > 0.3)
+                            aff_ok = (best_iou_d1 > 0.3) & (best_iou_d2 > 0.3)
                             if aff_ok.sum() > 0:
-                                m_hs = track_instances.output_embedding[mother_src[valid_d2][aff_ok]]
-                                p_hs = track_instances.output_embedding[proposal_start:proposal_end]
-                                logits_aff = self.div_proposal_mlp(m_hs, p_hs)  # [K_aff, N]
-                                loss_div_affinity = F.cross_entropy(logits_aff, best_prop_a[aff_ok])
-                                self.losses_dict[
-                                    'frame_{}_loss_div_affinity'.format(self._current_frame_idx)
-                                ] = loss_div_affinity
+                                K_aff    = aff_ok.sum().item()
+                                m_hs_all = track_instances.output_embedding[mother_src[valid][aff_ok]]
+                                p_hs_all = track_instances.output_embedding[proposal_start:proposal_end]
+                                prop_boxes_all = track_instances.pred_boxes[proposal_start:proposal_end].detach()
+
+                                # Filter proposals occupied by tracked non-dividing cells,
+                                # matching the free-proposal restriction used at inference.
+                                tracked_mask_tr = (track_instances.obj_idxes >= 0).clone()
+                                tracked_mask_tr[mother_src[valid][aff_ok]] = False
+                                if tracked_mask_tr.any():
+                                    tr_xyxy   = box_ops.box_cxcywh_to_xyxy(
+                                        track_instances.pred_boxes[tracked_mask_tr].clamp(0, 1).detach())
+                                    pr_xyxy   = box_ops.box_cxcywh_to_xyxy(prop_boxes_all.clamp(0, 1))
+                                    iou_occ_tr = pairwise_iou(Boxes(pr_xyxy), Boxes(tr_xyxy))
+                                    free_mask_tr = iou_occ_tr.max(dim=1).values < 0.5
+                                else:
+                                    free_mask_tr = torch.ones(n_proposals, dtype=torch.bool,
+                                                              device=prop_boxes_all.device)
+                                free_idx_tr = free_mask_tr.nonzero(as_tuple=True)[0]
+
+                                if len(free_idx_tr) >= 1:
+                                    p_hs_free   = p_hs_all[free_idx_tr]
+                                    logits_aff  = self.div_proposal_mlp(m_hs_all, p_hs_free)  # [K_aff, N_free]
+                                    # Remap GT targets to free-proposal indices
+                                    d1_free = (free_idx_tr.unsqueeze(0) ==
+                                               best_idx_d1[aff_ok].unsqueeze(1)).int().argmax(dim=1)
+                                    d2_free = (free_idx_tr.unsqueeze(0) ==
+                                               best_idx_d2[aff_ok].unsqueeze(1)).int().argmax(dim=1)
+                                    # Only keep rows where both GT proposals survived the filter
+                                    d1_in = free_mask_tr[best_idx_d1[aff_ok]]
+                                    d2_in = free_mask_tr[best_idx_d2[aff_ok]]
+                                    both_in = d1_in & d2_in
+                                    if both_in.any():
+                                        N_free = len(free_idx_tr)
+                                        target_aff = torch.zeros(both_in.sum().item(), N_free,
+                                                                 device=logits_aff.device)
+                                        target_aff[torch.arange(both_in.sum().item()),
+                                                   d1_free[both_in]] = 1.0
+                                        target_aff[torch.arange(both_in.sum().item()),
+                                                   d2_free[both_in]] = 1.0
+                                        # pos_weight counters heavy imbalance: N_free positions,
+                                        # only 2 positives per row (D1 and D2).
+                                        pos_w_aff = torch.tensor(
+                                            min(10.0, max(1.0, (N_free - 2) / 2.0)),
+                                            device=logits_aff.device)
+                                        loss_div_affinity = F.binary_cross_entropy_with_logits(
+                                            logits_aff[both_in], target_aff,
+                                            pos_weight=pos_w_aff)
+                                        self.losses_dict[
+                                            'frame_{}_loss_div_affinity'.format(self._current_frame_idx)
+                                        ] = loss_div_affinity
 
                 # Training-time D2 spawning (teacher-forced at flex_div frames).
                 if gt_instances_i.has('div_box2'):
@@ -485,6 +539,28 @@ class ClipMatcher(SetCriterion):
                             d2.query_pos        = pos2posemb(d2.ref_pts, num_pos_feats=_qd)
                             d2.mem_bank         = torch.zeros_like(mothers.mem_bank)
                             d2.mem_padding_mask = torch.ones_like(mothers.mem_padding_mask)
+                            # Snap D1 (mother's slot) to nearest D1 proposal, symmetric with D2.
+                            # GT D1 is the main box of the merged entry at the division frame.
+                            if n_proposals > 0:
+                                gt_d1_boxes = gt_instances_i.boxes[tgt_idx[d2_mask][valid_d2]].to(pred_logits_i.device)
+                                spawn_prop  = track_instances.pred_boxes[proposal_start:proposal_end].detach()
+                                iou_d1 = pairwise_iou(
+                                    Boxes(box_ops.box_cxcywh_to_xyxy(gt_d1_boxes)),
+                                    Boxes(box_ops.box_cxcywh_to_xyxy(spawn_prop)),
+                                )  # [M, N_proposals]
+                                best_iou_d1, best_idx_d1 = iou_d1.max(dim=1)
+                                d1_snap_ok = best_iou_d1 > 0.3
+                                if d1_snap_ok.any():
+                                    d1_pos = spawn_prop[best_idx_d1]
+                                    snap_idxs = div_src[d1_snap_ok]
+                                    snap_pos  = d1_pos[d1_snap_ok]
+                                    # pred_boxes is a view of the decoder output; clone
+                                    # before in-place write to satisfy autograd.
+                                    track_instances.pred_boxes = track_instances.pred_boxes.clone()
+                                    track_instances.ref_pts[snap_idxs]    = snap_pos
+                                    track_instances.pred_boxes[snap_idxs] = snap_pos
+                                    track_instances.query_pos[snap_idxs]  = pos2posemb(
+                                        snap_pos, num_pos_feats=_qd)
                             track_instances  = Instances.cat([track_instances, d2])
                             if track_instances.has('parent_obj_id'):
                                 track_instances.parent_obj_id[div_src] = mothers.obj_idxes.clone()
@@ -710,7 +786,10 @@ class MOTR(nn.Module):
             track_instances.query_pos = self.query_embed.weight
         else:
             track_instances.ref_pts = torch.cat([self.position.weight, proposals[:, :4]])
-            track_instances.query_pos = torch.cat([self.query_embed.weight, pos2posemb(proposals[:, 4:], d_model) + self.yolox_embed.weight])
+            # proposals[:, :4] = cxcywh box; proposals[:, 4] = score (not used for pos emb).
+            # pos2posemb expects [N, D_pos] and produces [N, D_pos * num_pos_feats].
+            # With D_pos=4 and num_pos_feats=d_model//4 the output is [N, d_model]. ✓
+            track_instances.query_pos = torch.cat([self.query_embed.weight, pos2posemb(proposals[:, :4], num_pos_feats=d_model // 4) + self.yolox_embed.weight])
         track_instances.output_embedding = torch.zeros((len(track_instances), d_model), device=device)
         track_instances.obj_idxes = torch.full((len(track_instances),), -1, dtype=torch.long, device=device)
         track_instances.matched_gt_idxes = torch.full((len(track_instances),), -1, dtype=torch.long, device=device)
@@ -771,41 +850,112 @@ class MOTR(nn.Module):
         if len(dividing_idxs) == 0:
             return track_instances
 
-        # --- D2 position: MLP-selected proposal or pred_div_boxes fallback ---
-        # The validity guard differs by path: when the MLP selects a proposal we
-        # validate the selected proposal box; when falling back to pred_div_boxes
-        # we validate pred_div_boxes.  Mixing the two (guarding on pred_div_boxes
-        # then overriding with a proposal) would wrongly reject valid divisions.
-        _mlp     = self.div_proposal_mlp  # registered on model; None when not configured
-        use_mlp  = _mlp is not None and n_proposals > 0 and proposal_end > proposal_start
-        m_boxes  = track_instances.pred_boxes[dividing_idxs]  # [K, 4] cxcywh
-        m_diag   = (m_boxes[:, 2].pow(2) + m_boxes[:, 3].pow(2)).sqrt().clamp(min=1e-4)
+        # --- Proposal-based D1 and D2 placement (single MLP, top-2 selection) ---
+        # The MLP scores cat(mother_hs, proposal_hs) for every proposal.
+        # It learns "how daughter-like is this proposal" without distinguishing D1/D2.
+        # Top-1 proposal → D1 (mother's slot snapped to it).
+        # Top-2 proposal → D2 (new spawned track).
+        # If only one proposal scores high (large gap), only D2 is spawned (D1 inherits
+        # mother's position as before). Fallback to pred_div_boxes when MLP unavailable.
+        _mlp    = self.div_proposal_mlp
+        use_mlp = _mlp is not None and n_proposals > 0 and proposal_end > proposal_start
+        m_boxes = track_instances.pred_boxes[dividing_idxs]  # [K, 4] cxcywh
+        m_diag  = (m_boxes[:, 2].pow(2) + m_boxes[:, 3].pow(2)).sqrt().clamp(min=1e-4)
 
+        sel_d1_global = None
+        sel_d2_global = None
+        d1_pos        = None
+
+        mlp_used = False
         if use_mlp:
             prop_hs    = track_instances.output_embedding[proposal_start:proposal_end]  # [N, d]
             mother_hs  = track_instances.output_embedding[dividing_idxs]               # [K, d]
-            logits_aff = _mlp(mother_hs, prop_hs)                                      # [K, N]
-            best_local = logits_aff.argmax(dim=1)                                      # [K] ∈ [0, N)
-            prop_boxes = track_instances.pred_boxes[proposal_start:proposal_end]       # [N, 4]
-            sel_boxes  = prop_boxes[best_local]                                        # [K, 4]
-            sel_dist   = ((sel_boxes[:, 0] - m_boxes[:, 0]).pow(2) +
-                          (sel_boxes[:, 1] - m_boxes[:, 1]).pow(2)).sqrt()
-            d2_valid      = (sel_boxes.abs().sum(dim=1) > 1e-4) & (sel_dist <= m_diag * 4.0)
-            dividing_idxs = dividing_idxs[d2_valid]
-            best_local    = best_local[d2_valid]
-            if len(dividing_idxs) == 0:
-                return track_instances
-            selected_global = proposal_start + best_local      # global indices into track_instances
-            d2_pos = track_instances.pred_boxes[selected_global].clone()
-        else:
-            d2_boxes = track_instances.pred_div_boxes[dividing_idxs]  # [K, 4]
+            prop_boxes = track_instances.pred_boxes[proposal_start:proposal_end]        # [N, 4]
+
+            # Restrict MLP to free proposals — those not already occupied by a tracked
+            # non-dividing cell.  Daughters must appear at untracked positions; proposals
+            # overlapping existing tracks are duplicates of those tracks, not daughters.
+            tracked_mask = (track_instances.obj_idxes >= 0).clone()
+            tracked_mask[dividing_idxs] = False   # dividing mothers are not "occupied"
+            if tracked_mask.any():
+                tracked_xyxy = box_ops.box_cxcywh_to_xyxy(
+                    track_instances.pred_boxes[tracked_mask].clamp(0, 1))
+                prop_xyxy = box_ops.box_cxcywh_to_xyxy(prop_boxes.clamp(0, 1))
+                iou_occ   = pairwise_iou(Boxes(prop_xyxy), Boxes(tracked_xyxy))  # [N, N_tracked]
+                free_mask = iou_occ.max(dim=1).values < 0.5
+            else:
+                free_mask = torch.ones(n_proposals, dtype=torch.bool, device=prop_boxes.device)
+
+            free_idx = free_mask.nonzero(as_tuple=True)[0]  # indices into proposal slice
+
+            if len(free_idx) >= 1:
+                free_prop_hs = prop_hs[free_idx]
+                logits = _mlp(mother_hs, free_prop_hs)  # [K, N_free]
+
+                if len(free_idx) >= 2:
+                    top2_result  = logits.topk(2, dim=1)
+                    top2_scores  = top2_result.values.sigmoid()   # [K, 2]
+                    top2_indices = top2_result.indices             # [K, 2] into free_idx
+                    # Two daughters found when the 2nd-best score also clears the bar.
+                    # Confident: top-1 → D1 (snap mother slot), top-2 → D2 (new track).
+                    # Not confident: only one location found → top-1 → D2 (best proposal),
+                    #                D1 inherits mother's current position (no snap).
+                    d1_confident  = top2_scores[:, 1] > 0.3       # [K] per-mother
+                    best_d1_local = free_idx[top2_indices[:, 0]]  # top-1; used only when d1_confident
+                    best_d2_local = torch.where(
+                        d1_confident,
+                        free_idx[top2_indices[:, 1]],  # confident: D2 = top-2
+                        free_idx[top2_indices[:, 0]]   # not confident: D2 = best (top-1)
+                    )
+                    # D2 MLP score: top-2 when two daughters found, top-1 otherwise.
+                    d2_mlp_score = torch.where(d1_confident, top2_scores[:, 1], top2_scores[:, 0])
+                else:
+                    best_d2_local = free_idx[logits.argmax(dim=1)]
+                    best_d1_local = None
+                    d1_confident  = None
+                    d2_mlp_score  = logits[:, 0].sigmoid()   # only one free proposal
+
+                # Validate D2: non-zero position, within plausible distance, and MLP
+                # score above minimum threshold.  If no proposal is confident enough,
+                # skip spawning rather than placing D2 at an arbitrary weak location.
+                sel_d2_boxes = prop_boxes[best_d2_local]
+                sel_d2_dist  = ((sel_d2_boxes[:, 0] - m_boxes[:, 0]).pow(2) +
+                                (sel_d2_boxes[:, 1] - m_boxes[:, 1]).pow(2)).sqrt()
+                d2_valid      = ((sel_d2_boxes.abs().sum(dim=1) > 1e-4) &
+                                 (sel_d2_dist <= m_diag * 4.0) &
+                                 (d2_mlp_score > 0.3))
+                dividing_idxs = dividing_idxs[d2_valid]
+                best_d2_local = best_d2_local[d2_valid]
+                if best_d1_local is not None:
+                    best_d1_local = best_d1_local[d2_valid]
+                    d1_confident  = d1_confident[d2_valid]
+                if len(dividing_idxs) == 0:
+                    return track_instances
+
+                sel_d2_global = proposal_start + best_d2_local
+                d2_pos = prop_boxes[best_d2_local].clone()
+                if best_d1_local is not None:
+                    d1_pos = prop_boxes[best_d1_local].clone()
+                    # Fall back to mother's current position for low-confidence D1 snaps.
+                    if d1_confident is not None and not d1_confident.all():
+                        m_boxes_cur = track_instances.pred_boxes[dividing_idxs]
+                        d1_pos[~d1_confident] = m_boxes_cur[~d1_confident]
+                    # Only suppress proposals that were actually adopted as D1.
+                    conf_d1 = d1_confident if d1_confident is not None else torch.ones(
+                        len(best_d1_local), dtype=torch.bool, device=best_d1_local.device)
+                    if conf_d1.any():
+                        sel_d1_global = proposal_start + best_d1_local[conf_d1]
+                mlp_used = True
+
+        if not mlp_used:
+            # Fallback: no free proposals or MLP not configured — use pred_div_boxes for D2.
+            d2_boxes = track_instances.pred_div_boxes[dividing_idxs]
             d2_dist  = ((d2_boxes[:, 0] - m_boxes[:, 0]).pow(2) +
                         (d2_boxes[:, 1] - m_boxes[:, 1]).pow(2)).sqrt()
             d2_valid      = (d2_boxes.abs().sum(dim=1) > 1e-4) & (d2_dist <= m_diag * 4.0)
             dividing_idxs = dividing_idxs[d2_valid]
             if len(dividing_idxs) == 0:
                 return track_instances
-            selected_global = None
             d2_pos = track_instances.pred_div_boxes[dividing_idxs].clone()
 
         mothers = track_instances[dividing_idxs]
@@ -827,24 +977,31 @@ class MOTR(nn.Module):
         d2.mem_bank          = torch.zeros_like(mothers.mem_bank)
         d2.mem_padding_mask  = torch.ones_like(mothers.mem_padding_mask)  # True = no memory
 
-        # D1: reset mother to unmatched high-confidence query.
+        # D1: reset mother slot and snap its position to the D1-selected proposal.
         track_instances.obj_idxes[dividing_idxs]        = -1
         track_instances.scores[dividing_idxs]           = torch.ones_like(mothers.scores)
         track_instances.iou[dividing_idxs]              = torch.ones_like(mothers.iou)
         track_instances.disappear_time[dividing_idxs]   = torch.zeros_like(mothers.disappear_time)
         track_instances.matched_gt_idxes[dividing_idxs] = torch.full_like(mothers.matched_gt_idxes, -1)
         track_instances.parent_obj_id[dividing_idxs]    = mothers.obj_idxes.clone()
+        if d1_pos is not None:
+            track_instances.ref_pts[dividing_idxs]    = d1_pos
+            track_instances.pred_boxes[dividing_idxs] = d1_pos
+            track_instances.query_pos[dividing_idxs]  = pos2posemb(d1_pos, num_pos_feats=_qd)
 
         for pid in mothers.obj_idxes.tolist():
             self.division_log.append({'parent_id': int(pid), 'd1_id': None, 'd2_id': None})
 
         track_instances = Instances.cat([track_instances, d2])
 
-        # Suppress the adopted proposal so RuntimeTrackerBase does not assign it
-        # a second new ID alongside the D2 query we just spawned from it.
-        if selected_global is not None:
-            track_instances.scores[selected_global]    = 0.0
-            track_instances.obj_idxes[selected_global] = -2  # -2 = explicit FP, excluded by tracker
+        # Suppress adopted proposals so RuntimeTrackerBase does not assign them
+        # new IDs alongside the daughter queries spawned from them.
+        if sel_d2_global is not None:
+            track_instances.scores[sel_d2_global]    = 0.0
+            track_instances.obj_idxes[sel_d2_global] = -2
+        if sel_d1_global is not None:
+            track_instances.scores[sel_d1_global]    = 0.0
+            track_instances.obj_idxes[sel_d1_global] = -2
 
         return track_instances
 
@@ -1297,7 +1454,32 @@ class MOTR(nn.Module):
             p_start = frame_res.get('proposal_start', self.num_queries)
             p_end   = frame_res.get('proposal_end', p_start + n_prop)
             track_instances = self._spawn_daughter2_tracks(track_instances, n_prop, p_start, p_end)
+
+            # Record carry-over tracks (obj_idxes >= 0) AFTER daughter spawning.
+            # Spawned mothers have already been reset to -1, so they are correctly
+            # excluded from this mask and won't suppress their own re-detection (D1).
+            was_tracked = (track_instances.obj_idxes >= 0).clone()
+
             self.track_base.update(track_instances)
+
+            # NMS: suppress fresh detections that duplicate carry-over tracks.
+            # At each frame, _generate_empty_tracks prepends num_queries + n_proposals
+            # fresh slots (obj_idxes=-1). After update(), any fresh slot that scored
+            # >= score_thresh gets a new ID. If that slot overlaps a carry-over track
+            # (IoU > 0.5), it is a duplicate — reset it to -1 so QIMv2 drops it.
+            newly_detected = (~was_tracked) & (track_instances.obj_idxes >= 0)
+            if newly_detected.any() and was_tracked.any():
+                new_boxes   = box_ops.box_cxcywh_to_xyxy(
+                    track_instances.pred_boxes[newly_detected].clamp(0, 1))
+                carry_boxes = box_ops.box_cxcywh_to_xyxy(
+                    track_instances.pred_boxes[was_tracked].clamp(0, 1))
+                iou_mat = pairwise_iou(Boxes(new_boxes), Boxes(carry_boxes))  # [Nnew, Ncarry]
+                max_iou = iou_mat.max(dim=1).values
+                suppress = max_iou > 0.5
+                if suppress.any():
+                    new_idxs = newly_detected.nonzero(as_tuple=True)[0]
+                    track_instances.obj_idxes[new_idxs[suppress]] = -1
+                    track_instances.scores[new_idxs[suppress]]    = 0.0
         if self.memory_bank is not None:
             track_instances = self.memory_bank(track_instances)
         tmp = {}
