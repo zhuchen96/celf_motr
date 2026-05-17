@@ -38,7 +38,8 @@ shared_decoder: true
 #   moma: max 17 cells/frame → 20 is enough
 # num_queries_detect: detection proposals fed to the tracker
 num_queries: 20
-num_queries_detect: 100
+# p95=9 cells/frame → 40 proposals more than covers detection needs
+num_queries_detect: 40
 
 # --- query interaction ---
 query_interaction_layer: QIMv2
@@ -48,10 +49,10 @@ merger_dropout: 0.0
 dropout: 0.0
 
 # --- sampling / curriculum ---
-# Start with sampler_lengths: [2] for quick testing.
-# Increase to [2, 3, 4] with sampler_steps: [5, 10] for full training.
+# sample_interval MUST be 1: division supervision requires t and t+1 consecutive
+# in the same clip (a stride-N clip misses divisions at frames t+1…t+N-1).
 sample_mode: random_interval
-sample_interval: 5
+sample_interval: 1
 sampler_lengths: [2, 3, 4]
 sampler_steps: [5, 10]
 
@@ -81,14 +82,18 @@ focal_alpha: 0.25
 aux_loss: true
 
 # --- division prediction ---
-# Requires man_track/<split>/<seq>.txt files at mot_path.
-# Set to 0.0 to disable if man_track is not available.
-div_loss_coef: 1.0
+# moma: ~97% of tracks divide (avg track length ~6 frames → ~17% per-cell-frame
+# positive rate → pos_weight ≈ 5 matches deepcell, no change needed).
+# loss_div_class uses reduction='mean' so div_loss_coef doesn't scale with K.
+div_loss_coef: 5.0
+# MLP affinity loss for parent-link training (needed for lineage reconstruction).
+div_affinity_loss_coef: 1.0
 
 # --- division-clip oversampling ---
-# Fraction of training clips guaranteed to contain a dividing cell.
-# 0.0 = uniform sampling.  Recommended: 0.3–0.5 for rare-division datasets.
-div_ratio: 0.3
+# moma: divisions are ubiquitous (every clip already contains dividing cells),
+# so no oversampling is needed.  birth_oversample=0 eliminates gradient variance.
+div_ratio: 0.0
+birth_oversample: 0
 
 # --- self-proposal ---
 score_threshold: 0.05

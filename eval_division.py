@@ -67,6 +67,10 @@ def mask_iou(gt_mask, gt_label, pred_mask):
 
     Returns a dict  pred_label → IoU  for all pred_labels that overlap.
     """
+    if pred_mask.shape != gt_mask.shape:
+        pred_mask = cv2.resize(pred_mask, (gt_mask.shape[1], gt_mask.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
+
     gt_pixels = gt_mask == gt_label
     gt_area   = int(gt_pixels.sum())
     if gt_area == 0:
@@ -201,9 +205,9 @@ def evaluate_sequence(seq_key, gt_dir: Path, res_dir: Path, iou_thr: float):
 
 def main():
     parser = argparse.ArgumentParser('Division-specific evaluation')
-    parser.add_argument('--gt_dir',  default='/srv/home/chen/Cell-TRACTR/data/deepcell/CTC/val',
+    parser.add_argument('--gt_dir',  default='/srv/home/chen/Cell-TRACTR/data/moma/CTC/val',
                         help='CTC ground-truth directory containing {seq}_GT/TRA/')
-    parser.add_argument('--res_dir', default='/srv/home/chen/cell_motr/self/outputs/cell_deepcell_eval',
+    parser.add_argument('--res_dir', default='/srv/home/chen/cell_motr/self/outputs/cell_moma_eval',
                         help='eval_cell.py output directory containing {seq}_RES/')
     parser.add_argument('--iou_thr', type=float, default=0.3,
                         help='Minimum IoU to count a daughter as detected (default 0.3)')

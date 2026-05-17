@@ -171,9 +171,9 @@ def render_sequence(seq_key, res_dir: Path, img_dir: Path, frame_files: list,
 
 def main():
     parser = argparse.ArgumentParser('Visualise CTC inference results')
-    parser.add_argument('--res_dir',   default="/srv/home/chen/cell_motr/self/outputs/cell_deepcell_eval",
+    parser.add_argument('--res_dir',   default="/srv/home/chen/cell_motr/self/outputs/cell_moma_eval",
                         help='eval_cell.py output_dir (contains *_RES/ subdirs)')
-    parser.add_argument('--mot_path',  default="/srv/home/chen/Cell-TRACTR/data/deepcell/COCO",
+    parser.add_argument('--mot_path',  default="/srv/home/chen/Cell-TRACTR/data/moma/COCO",
                         help='COCO dataset root (same as eval_cell.py --mot_path)')
     parser.add_argument('--split',     default='val', choices=['train', 'val'])
     parser.add_argument('--video_dir', default=None,

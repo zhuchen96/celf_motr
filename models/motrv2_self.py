@@ -918,12 +918,16 @@ class MOTR(nn.Module):
                 # Validate D2: non-zero position, within plausible distance, and MLP
                 # score above minimum threshold.  If no proposal is confident enough,
                 # skip spawning rather than placing D2 at an arbitrary weak location.
+                # Hard distance cap: daughters appear within ~2 mother-diagonals,
+                # capped at 0.15 normalised (~90 px on a 600-px image ≈ 1 cell diameter).
+                max_spawn_dist = (m_diag * 2.0).clamp(max=0.15)
                 sel_d2_boxes = prop_boxes[best_d2_local]
                 sel_d2_dist  = ((sel_d2_boxes[:, 0] - m_boxes[:, 0]).pow(2) +
                                 (sel_d2_boxes[:, 1] - m_boxes[:, 1]).pow(2)).sqrt()
                 d2_valid      = ((sel_d2_boxes.abs().sum(dim=1) > 1e-4) &
-                                 (sel_d2_dist <= m_diag * 4.0) &
+                                 (sel_d2_dist <= max_spawn_dist) &
                                  (d2_mlp_score > 0.3))
+                max_spawn_dist = max_spawn_dist[d2_valid]
                 dividing_idxs = dividing_idxs[d2_valid]
                 best_d2_local = best_d2_local[d2_valid]
                 if best_d1_local is not None:
@@ -936,9 +940,14 @@ class MOTR(nn.Module):
                 d2_pos = prop_boxes[best_d2_local].clone()
                 if best_d1_local is not None:
                     d1_pos = prop_boxes[best_d1_local].clone()
+                    m_boxes_cur = track_instances.pred_boxes[dividing_idxs]
+                    # Reject D1 snaps that are spatially implausible (same cap as D2).
+                    d1_snap_dist = ((d1_pos[:, 0] - m_boxes_cur[:, 0]).pow(2) +
+                                    (d1_pos[:, 1] - m_boxes_cur[:, 1]).pow(2)).sqrt()
+                    if d1_confident is not None:
+                        d1_confident = d1_confident & (d1_snap_dist <= max_spawn_dist)
                     # Fall back to mother's current position for low-confidence D1 snaps.
                     if d1_confident is not None and not d1_confident.all():
-                        m_boxes_cur = track_instances.pred_boxes[dividing_idxs]
                         d1_pos[~d1_confident] = m_boxes_cur[~d1_confident]
                     # Only suppress proposals that were actually adopted as D1.
                     conf_d1 = d1_confident if d1_confident is not None else torch.ones(
@@ -952,7 +961,8 @@ class MOTR(nn.Module):
             d2_boxes = track_instances.pred_div_boxes[dividing_idxs]
             d2_dist  = ((d2_boxes[:, 0] - m_boxes[:, 0]).pow(2) +
                         (d2_boxes[:, 1] - m_boxes[:, 1]).pow(2)).sqrt()
-            d2_valid      = (d2_boxes.abs().sum(dim=1) > 1e-4) & (d2_dist <= m_diag * 4.0)
+            max_spawn_dist = (m_diag * 2.0).clamp(max=0.15)
+            d2_valid      = (d2_boxes.abs().sum(dim=1) > 1e-4) & (d2_dist <= max_spawn_dist)
             dividing_idxs = dividing_idxs[d2_valid]
             if len(dividing_idxs) == 0:
                 return track_instances
