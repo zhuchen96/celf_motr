@@ -71,6 +71,13 @@ class CTCCellDataset:
         assert ann_file.exists(), f'Annotation file not found: {ann_file}'
         assert self.img_dir.exists(), f'Image directory not found: {self.img_dir}'
 
+        # CTC mask directory: parent of COCO root has CTC/train/<seq>_GT/TRA/
+        ctc_root = root.parent / 'CTC'
+        self.ctc_mask_dir = ctc_root / image_set
+        self.load_masks = getattr(args, 'masks', False) and self.ctc_mask_dir.exists()
+        if self.load_masks:
+            print(f"  [CTCCellDataset] Mask loading enabled from {self.ctc_mask_dir}")
+
         with open(ann_file) as f:
             data = json.load(f)
 
@@ -324,6 +331,8 @@ class CTCCellDataset:
             gt.div_ahead_flags = targets['div_ahead_flags'][:n_gt]
         if 'div_box2' in targets:
             gt.div_box2 = targets['div_box2'][:n_gt]
+        if 'masks' in targets:
+            gt.masks = targets['masks'][:n_gt]
         return gt
 
     def _load_frame(self, seq_idx: int, frame_pos: int):
@@ -373,6 +382,7 @@ class CTCCellDataset:
         # ---- Step 2: build GT tensors ----
         boxes, labels, obj_ids = [], [], []
         div_flags, div_ahead_flags, div_box2s = [], [], []
+        _mask_cell_ids = []  # per-entry mask spec: ('div', d1_id, d2_id) or ('cell', cell_id)
 
         # Merged division entries (daughters' birth frame)
         for parent_id, parts in merged.items():
@@ -384,6 +394,7 @@ class CTCCellDataset:
                 div_flags.append(1.0)
                 div_ahead_flags.append(0.0)
                 div_box2s.append(torch.tensor(d2_ann['bbox'], dtype=torch.float32))
+                _mask_cell_ids.append(('div', d1_ann['track_id'], d2_ann['track_id']))
             else:
                 # One daughter left the FOV; treat the remaining one as a single cell
                 ann = d1_ann if d1_ann is not None else d2_ann
@@ -393,6 +404,7 @@ class CTCCellDataset:
                 div_flags.append(0.0)
                 div_ahead_flags.append(0.0)
                 div_box2s.append(torch.zeros(4, dtype=torch.float32))
+                _mask_cell_ids.append(('cell', ann['track_id']))
 
         # Regular (non-daughter) cells
         for ann in anns:
@@ -406,6 +418,7 @@ class CTCCellDataset:
             div_flags.append(0.0)
             div_ahead_flags.append(1.0 if is_div_ahead else 0.0)
             div_box2s.append(torch.zeros(4, dtype=torch.float32))
+            _mask_cell_ids.append(('cell', cell_id))
 
         targets = {
             'dataset': 'CTC_cell',
@@ -421,6 +434,30 @@ class CTCCellDataset:
             'size': torch.as_tensor([h, w]),
             'orig_size': torch.as_tensor([h, w]),
         }
+
+        # Load CTC instance segmentation mask for this frame
+        if self.load_masks:
+            import cv2 as _cv2
+            mask_path = (self.ctc_mask_dir /
+                         f'{seq_key}_GT' / 'TRA' / f'man_track{frame_nb:03d}.tif')
+            if mask_path.exists():
+                label_img = _cv2.imread(str(mask_path), _cv2.IMREAD_UNCHANGED)  # uint16
+                H_m, W_m = label_img.shape[:2]
+                cell_masks = []
+                for spec in _mask_cell_ids:
+                    if spec[0] == 'div':
+                        _, d1_id, d2_id = spec
+                        bm = (label_img == d1_id) | (label_img == d2_id)
+                    else:
+                        _, cell_id = spec
+                        bm = (label_img == cell_id)
+                    cell_masks.append(bm)
+                if cell_masks:
+                    targets['masks'] = torch.from_numpy(
+                        np.stack(cell_masks, axis=0))
+                else:
+                    targets['masks'] = torch.zeros((0, H_m, W_m), dtype=torch.bool)
+
         return img, targets
 
     # ------------------------------------------------------------------

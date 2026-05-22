@@ -4,8 +4,8 @@
 
 # --- paths ---
 mot_path: /srv/home/chen/Cell-TRACTR/data/deepcell/COCO
-output_dir: /srv/home/chen/cell_motr/self/outputs/cell_deepcell_eval
-resume: /srv/home/chen/cell_motr/self/outputs/cell_deepcell/checkpoint.pth
+output_dir: /srv/home/chen/cell_motr/self/outputs/cell_deepcell_self_eval
+resume: /srv/home/chen/cell_motr/self/outputs/cell_deepcell_self/checkpoint.pth
 
 # --- dataset ---
 dataset_file: e2e_cell
@@ -74,10 +74,13 @@ sampler_lengths: [1]
 sampler_steps: ~
 
 # --- division prediction ---
-div_loss_coef: 1.0
+div_loss_coef: 10.0
 # MUST match training value — controls whether both DivisionProposalMLPs are built.
 # If 0 (or absent), neither MLP is instantiated and checkpoint weights are silently skipped.
 div_affinity_loss_coef: 1.0
+
+# --- score consistency (must match training to keep weight_dict consistent) ---
+score_consist_loss_coef: 2.0
 
 # --- runtime ---
 batch_size: 1
@@ -86,7 +89,8 @@ device: cuda
 seed: 42
 
 # --- output format ---
-masks: false
+masks: true
+mask_loss_coef: 2.0
 
 # --- unused / keep defaults ---
 aux_loss: true

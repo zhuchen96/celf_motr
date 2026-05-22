@@ -148,11 +148,11 @@ class QueryInteractionModulev2(QueryInteractionBase):
         is_pos = track_instances.scores > self.score_thr
         track_instances.ref_pts[is_pos] = track_instances.pred_boxes.detach().clone()[is_pos]
 
-        out_embed = track_instances.output_embedding
-        query_feat = track_instances.query_pos
+        out_embed = track_instances.output_embedding  # decoder hidden state, current frame
         query_pos = pos2posemb(track_instances.ref_pts)
         q = k = query_pos + out_embed
 
+        # Self-attention across active tracks (cross-track interaction).
         tgt = out_embed
         tgt2 = self.self_attn(q[:, None], k[:, None], value=tgt[:, None])[0][:, 0]
         tgt = tgt + self.dropout1(tgt2)
@@ -168,10 +168,19 @@ class QueryInteractionModulev2(QueryInteractionBase):
             query_pos = self.norm_pos(query_pos)
             track_instances.query_pos = query_pos
 
+        # Ground the next-frame content query in the CURRENT hidden state (out_embed),
+        # not the accumulated query_feat from previous frames.
+        #
+        # Old code: query_feat = old_query_feat + FFN(tgt)
+        #   → residual into stale embedding; low-score tracks never refreshed (is_pos mask)
+        #
+        # New code: query_feat = out_embed + FFN(tgt)
+        #   → always grounded in this frame's cell representation, like Cell-TRACTR's
+        #     direct hs_embed pass-through, but with the QIM self-attention correction
+        #     on top. All active tracks are refreshed regardless of score level.
         query_feat2 = self.linear_feat2(self.dropout_feat1(self.activation(self.linear_feat1(tgt))))
-        query_feat = query_feat + self.dropout_feat2(query_feat2)
-        query_feat = self.norm_feat(query_feat)
-        track_instances.query_pos[is_pos] = query_feat[is_pos]
+        query_feat = self.norm_feat(out_embed + self.dropout_feat2(query_feat2))
+        track_instances.query_pos = query_feat
 
         return track_instances
 

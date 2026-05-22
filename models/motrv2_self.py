@@ -31,6 +31,7 @@ from .matcher import build_matcher
 from .deformable_transformer_plusv2 import build_deforamble_transformer, pos2posemb
 from .qimv2 import build as build_query_interaction_layer
 from .deformable_detrv2 import SetCriterion, MLP, sigmoid_focal_loss
+from .segmentation import MHAttentionMap, dice_loss
 
 
 class DivisionProposalMLP(nn.Module):
@@ -58,12 +59,48 @@ class DivisionProposalMLP(nn.Module):
         return self.net(torch.cat([m, p], dim=-1)).squeeze(-1)
 
 
+class SimpleMaskHead(nn.Module):
+    """Per-query instance mask prediction via cross-attention to encoder memory.
+
+    Uses MHAttentionMap to compute per-query attention over the highest-resolution
+    encoder feature map (level 0, 1/8 of the input image), applies a small conv
+    to refine the nheads maps into one, then bilinearly upsamples to image size.
+    """
+    def __init__(self, d_model: int, nheads: int):
+        super().__init__()
+        self.attn = MHAttentionMap(d_model, d_model, nheads, dropout=0.0)
+        self.refine = nn.Sequential(
+            nn.Conv2d(nheads, nheads, 3, padding=1),
+            nn.GroupNorm(min(8, nheads), nheads),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(nheads, 1, 1),
+        )
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_uniform_(m.weight, a=1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, hs: Tensor, memory_2d: Tensor) -> Tensor:
+        """
+        hs:        [B, N, D]      decoder hidden states
+        memory_2d: [B, D, H0, W0] level-0 encoder spatial features
+        Returns:   [B, N, H0, W0] mask logits (before sigmoid, before upsampling)
+        """
+        attn = self.attn(hs, memory_2d)          # [B, N, nheads, H0, W0]
+        B, N, nh, H0, W0 = attn.shape
+        x = attn.view(B * N, nh, H0, W0)         # merge batch & query
+        x = self.refine(x)                         # [B*N, 1, H0, W0]
+        return x.view(B, N, H0, W0)
+
+
 class ClipMatcher(SetCriterion):
     def __init__(self, num_classes,
                         matcher,
                         weight_dict,
                         losses,
-                        div_proposal_mlp=None):
+                        div_proposal_mlp=None,
+                        score_consist_loss_coef=0.0,
+                        mask_loss_coef=0.0):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -72,6 +109,7 @@ class ClipMatcher(SetCriterion):
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             div_proposal_mlp: optional DivisionProposalMLP for affinity loss (both daughters)
+            score_consist_loss_coef: weight for score consistency loss across frames (0 = disabled)
         """
         super().__init__(num_classes, matcher, weight_dict, losses)
         self.num_classes = num_classes
@@ -81,6 +119,8 @@ class ClipMatcher(SetCriterion):
         self.focal_loss = True
         self.losses_dict = {}
         self._current_frame_idx = 0
+        self.score_consist_loss_coef = score_consist_loss_coef
+        self.mask_loss_coef = mask_loss_coef
         # Store as a plain attribute (not an nn.Module child) so this criterion does
         # not double-register the MLP.  The MLP is owned by the MOTR model and is
         # included in model.parameters() / model.state_dict() from there.
@@ -92,6 +132,7 @@ class ClipMatcher(SetCriterion):
         self.sample_device = None
         self._current_frame_idx = 0
         self.losses_dict = {}
+        self._prev_scores = {}  # obj_id (int) -> detached score from previous frame
 
     def _step(self):
         self._current_frame_idx += 1
@@ -229,9 +270,48 @@ class ClipMatcher(SetCriterion):
         track_instances.matched_gt_idxes[i] = j
 
         full_track_idxes = torch.arange(len(track_instances), dtype=torch.long, device=pred_logits_i.device)
-        matched_track_idxes = (track_instances.obj_idxes >= 0)  # occu 
+        matched_track_idxes = (track_instances.obj_idxes >= 0)  # occu
         prev_matched_indices = torch.stack(
             [full_track_idxes[matched_track_idxes], track_instances.matched_gt_idxes[matched_track_idxes]], dim=1)
+
+        # Score consistency loss: carry-over tracks that still have a GT match should
+        # maintain stable confidence across frames.  We penalise the MSE between the
+        # current frame's score and the (detached) score stored from the previous frame.
+        # This teaches the model to commit to a confidence level rather than oscillating
+        # around the threshold, which is the root cause of partial-coverage tracks.
+        if self.score_consist_loss_coef > 0 and self._current_frame_idx > 0:
+            # Always write the key so all ranks have the same keys in loss_dict
+            # (prevent reduce_dict deadlock when some ranks have no carry-overs).
+            loss_consist = pred_logits_i.sum() * 0.0
+            if len(prev_matched_indices) > 0:
+                still_gt = prev_matched_indices[:, 1] >= 0
+                if still_gt.sum() > 0:
+                    carry_src = prev_matched_indices[still_gt, 0]
+                    cur_scores = pred_logits_i[carry_src, 0].sigmoid()
+                    prev_score_vals, valid = [], []
+                    for src in carry_src.tolist():
+                        oid = int(track_instances.obj_idxes[src].item())
+                        if oid in self._prev_scores:
+                            prev_score_vals.append(self._prev_scores[oid])
+                            valid.append(True)
+                        else:
+                            valid.append(False)
+                    if any(valid):
+                        valid_t = torch.tensor(valid, dtype=torch.bool, device=cur_scores.device)
+                        prev_t = torch.stack(prev_score_vals).to(cur_scores.device)
+                        loss_consist = F.mse_loss(cur_scores[valid_t], prev_t, reduction='mean')
+            self.losses_dict[
+                'frame_{}_loss_score_consist'.format(self._current_frame_idx)
+            ] = loss_consist
+
+        # Update stored scores for carry-over tracks with valid GT match.
+        if len(prev_matched_indices) > 0:
+            still_gt = prev_matched_indices[:, 1] >= 0
+            if still_gt.sum() > 0:
+                carry_src = prev_matched_indices[still_gt, 0]
+                for src in carry_src.tolist():
+                    oid = int(track_instances.obj_idxes[src].item())
+                    self._prev_scores[oid] = pred_logits_i[src, 0].sigmoid().detach().cpu()
 
         # step2. select the unmatched slots.
         # note that the FP tracks whose obj_idxes are -2 will not be selected here.
@@ -591,6 +671,34 @@ class ClipMatcher(SetCriterion):
                     p.sum() * 0.0 for p in self.div_proposal_mlp.parameters()
                 )
 
+        # Mask loss: for each GT-matched carry-over or new query, penalise
+        # sigmoid_focal + dice between predicted mask and GT binary mask.
+        # The key is ALWAYS written so all ranks have the same keys in loss_dict,
+        # preventing reduce_dict deadlocks when some ranks have no GT masks.
+        if self.mask_loss_coef > 0 and 'pred_masks' in outputs_without_aux:
+            pred_masks = outputs_without_aux['pred_masks']  # [1, N_queries, H, W]
+            loss_m = pred_masks.sum() * 0.0  # zero sentinel keeps grad graph alive
+            if gt_instances_i.has('masks'):
+                valid = matched_indices[:, 1] >= 0
+                if valid.sum() > 0:
+                    src_idx = matched_indices[valid, 0]
+                    tgt_idx = matched_indices[valid, 1]
+                    src_masks = pred_masks[0, src_idx]          # [K, H, W]
+                    tgt_masks = gt_instances_i.masks[tgt_idx].float()  # [K, H, W]
+                    if tgt_masks.shape[-2:] != src_masks.shape[-2:]:
+                        tgt_masks = F.interpolate(
+                            tgt_masks.unsqueeze(1),
+                            size=src_masks.shape[-2:],
+                            mode='nearest').squeeze(1)
+                    K = src_masks.shape[0]
+                    loss_m = dice_loss(src_masks.flatten(1), tgt_masks.flatten(1), K)
+                    loss_m = loss_m + sigmoid_focal_loss(
+                        src_masks.flatten(1), tgt_masks.flatten(1),
+                        num_boxes=K, alpha=0.25, gamma=2, mean_in_dim1=False)
+            self.losses_dict[
+                'frame_{}_loss_mask'.format(self._current_frame_idx)
+            ] = loss_m
+
         self._step()
         return track_instances
 
@@ -672,7 +780,7 @@ def _get_clones(module, N):
 class MOTR(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_queries_detect, num_feature_levels, criterion, track_embed,
                  aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False, query_denoise=0,
-                 div_score_thresh=0.4, div_proposal_mlp=None):
+                 div_score_thresh=0.4, div_proposal_mlp=None, mask_head=None):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -774,6 +882,7 @@ class MOTR(nn.Module):
         # and model.state_dict() — critical for optimizer updates and checkpoint I/O.
         # ClipMatcher holds only a non-owning reference (via object.__setattr__).
         self.div_proposal_mlp = div_proposal_mlp  # nn.Module or None
+        self.mask_head = mask_head                 # SimpleMaskHead or None
         self.memory_bank = memory_bank
         self.mem_bank_len = 0 if memory_bank is None else memory_bank.max_his_length
 
@@ -1455,6 +1564,24 @@ class MOTR(nn.Module):
         track_instances.pred_boxes = frame_res['pred_boxes'][0, :, :4]
         track_instances.pred_div_boxes = frame_res['pred_boxes'][0, :, 4:]
         track_instances.output_embedding = frame_res['hs'][0]
+        # Mask prediction: cross-attend decoder hs to level-0 encoder memory.
+        if self.mask_head is not None and 'encoder_memory' in frame_res:
+            mem   = frame_res['encoder_memory']        # [1, ΣHiWi, D]
+            ss    = frame_res['encoder_spatial_shapes'] # [L, 2] int tensor
+            H0, W0 = int(ss[0, 0]), int(ss[0, 1])
+            D = mem.shape[-1]
+            mem_2d = mem[:, :H0 * W0, :].view(1, H0, W0, D).permute(0, 3, 1, 2)
+            hs_q   = frame_res['hs']                   # [1, N_queries, D]
+            m_logits = self.mask_head(hs_q, mem_2d)    # [1, N_queries, H0, W0]
+            img_hw = frame_res.get('img_hw')
+            if img_hw is not None:
+                m_logits = F.interpolate(
+                    m_logits[0].unsqueeze(1),          # [N, 1, H0, W0]
+                    size=img_hw,
+                    mode='bilinear', align_corners=False,
+                ).squeeze(1).unsqueeze(0)              # [1, N, H, W]
+            frame_res['pred_masks'] = m_logits
+            track_instances.pred_masks = m_logits[0]  # [N, H, W] or [N, H0, W0]
         if self.training:
             frame_res['track_instances'] = track_instances
             track_instances = self.criterion.match_for_single_frame(frame_res)
@@ -1543,6 +1670,10 @@ class MOTR(nn.Module):
         res['n_proposals']    = len(proposals) if proposals is not None else 0
         res['proposal_start'] = self.num_queries
         res['proposal_end']   = self.num_queries + res['n_proposals']
+        if self.mask_head is not None:
+            res['encoder_memory']         = memory
+            res['encoder_spatial_shapes'] = spatial_shapes
+            res['img_hw']                 = tuple(img.tensors.shape[-2:])
         res = self._post_process_single_image(res, track_instances, False)
 
         track_instances = res['track_instances']
@@ -1555,7 +1686,7 @@ class MOTR(nn.Module):
             ref_pts = ref_pts * scale_fct[None]
             ret['ref_pts'] = ref_pts
         return ret
-    
+
     @torch.no_grad()
     def inference_single_image_detector(self, img, ori_img_size, proposals=None):
         if not isinstance(img, NestedTensor):
@@ -1772,6 +1903,11 @@ class MOTR(nn.Module):
             frame_res['n_proposals']    = len(proposals) if proposals is not None else 0
             frame_res['proposal_start'] = self.num_queries
             frame_res['proposal_end']   = self.num_queries + frame_res['n_proposals']
+            if self.mask_head is not None:
+                frame_res['encoder_memory']         = cache['memory']
+                frame_res['encoder_spatial_shapes'] = cache['spatial_shapes']
+                _frame_nt = frame if isinstance(frame, NestedTensor) else nested_tensor_from_tensor_list([frame])
+                frame_res['img_hw']                 = tuple(_frame_nt.tensors.shape[-2:])
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last)
 
             track_instances = frame_res['track_instances']
@@ -1945,6 +2081,8 @@ def build(args):
     num_frames_per_batch = max(args.sampler_lengths) + 1
     div_loss_coef = getattr(args, 'div_loss_coef', 0.0)
     div_affinity_loss_coef = getattr(args, 'div_affinity_loss_coef', 0.0)
+    score_consist_loss_coef = getattr(args, 'score_consist_loss_coef', 0.0)
+    mask_loss_coef = getattr(args, 'mask_loss_coef', 0.0)
     weight_dict = {}
     for i in range(num_frames_per_batch):
         weight_dict.update({"frame_{}_loss_ce".format(i): args.cls_loss_coef,
@@ -1956,6 +2094,10 @@ def build(args):
             weight_dict["frame_{}_loss_div_class".format(i)] = div_loss_coef
         if div_affinity_loss_coef > 0:
             weight_dict["frame_{}_loss_div_affinity".format(i)] = div_affinity_loss_coef
+        if score_consist_loss_coef > 0:
+            weight_dict["frame_{}_loss_score_consist".format(i)] = score_consist_loss_coef
+        if mask_loss_coef > 0:
+            weight_dict["frame_{}_loss_mask".format(i)] = mask_loss_coef
 
     # TODO this is a hack
     if args.aux_loss:
@@ -1981,8 +2123,12 @@ def build(args):
     # as a model submodule (for optimizer + checkpoint) while criterion holds only
     # a non-owning reference (via object.__setattr__).
     div_proposal_mlp = DivisionProposalMLP(d_model) if div_affinity_loss_coef > 0 else None
+    nheads = args.nheads
+    mask_head = SimpleMaskHead(d_model, nheads) if getattr(args, 'masks', False) else None
     criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses,
-                            div_proposal_mlp=div_proposal_mlp)
+                            div_proposal_mlp=div_proposal_mlp,
+                            score_consist_loss_coef=score_consist_loss_coef,
+                            mask_loss_coef=mask_loss_coef)
     criterion.to(device)
     postprocessors = {}
     model = MOTR(
@@ -2002,5 +2148,6 @@ def build(args):
         query_denoise=args.query_denoise,
         div_score_thresh=getattr(args, 'div_score_thresh', 0.4),
         div_proposal_mlp=div_proposal_mlp,
+        mask_head=mask_head,
     )
     return model, criterion, postprocessors

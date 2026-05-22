@@ -568,6 +568,11 @@ class MotRandomRotate90(object):
                 else:        # k==3, CW 90°
                     target_i['div_box2'] = torch.stack([h - by2, bx1, h - by1, bx2], dim=1)
 
+            if 'masks' in target_i:
+                m = target_i['masks'].numpy()    # [N, H, W] bool
+                m_rot = np.rot90(m, k=k, axes=(1, 2))   # rotate spatial dims
+                target_i['masks'] = torch.from_numpy(np.ascontiguousarray(m_rot))
+
             ret_imgs.append(new_img)
             ret_targets.append(target_i)
 

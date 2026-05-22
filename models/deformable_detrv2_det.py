@@ -594,8 +594,8 @@ def build(args):
         weight_dict.update(aux_weight_dict)
 
     losses = ['labels', 'boxes', 'cardinality']
-    if args.masks:
-        losses += ["masks"]
+    # Note: mask loss is handled by ClipMatcher (motrv2_self.py), not by the
+    # detector criterion, which has no mask head.
     # num_classes, matcher, weight_dict, losses, focal_alpha=0.25
     if args.mix_match:
         criterion = MixSetCriterion(num_classes, matcher, weight_dict, losses, focal_alpha=args.focal_alpha)

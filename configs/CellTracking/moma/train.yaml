@@ -89,6 +89,12 @@ div_loss_coef: 5.0
 # MLP affinity loss for parent-link training (needed for lineage reconstruction).
 div_affinity_loss_coef: 1.0
 
+# --- score consistency ---
+# Penalises MSE between a track's confidence score at frame t vs frame t-1.
+# Forces the model to commit to stable scores instead of oscillating around
+# the threshold (which causes partial/dropout coverage at inference).
+score_consist_loss_coef: 2.0
+
 # --- division-clip oversampling ---
 # moma: divisions are ubiquitous (every clip already contains dividing cells),
 # so no oversampling is needed.  birth_oversample=0 eliminates gradient variance.
@@ -110,7 +116,8 @@ seed: 42
 use_checkpoint: false   # gradient checkpointing (saves VRAM, slower)
 
 # --- unused / keep defaults ---
-masks: false
+masks: true
+mask_loss_coef: 2.0
 memory_bank_type: ~
 memory_bank_score_thresh: 0.0
 memory_bank_len: 4

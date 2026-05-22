@@ -45,14 +45,15 @@ dropout: 0.0
 # update_score_threshold: same value used by RuntimeTrackerBase internally
 # proposal_threshold:     minimum detector confidence to generate a proposal
 # miss_tolerance:         frames a track can be invisible before being killed
-score_threshold: 0.5
-update_score_threshold: 0.5
+score_threshold: 0.2
+update_score_threshold: 0.2
 proposal_threshold: 0.05
 miss_tolerance: 12
 
 # --- gap closing (post-processing) ---
 gap_close_frames: 5          # stitch tracks separated by up to this many frames
 gap_close_dist_factor: 1.5   # max stitching distance as × of the smaller track's box diagonal
+min_track_len: 1             # drop tracks shorter than this (1 = keep all)
 
 # --- split to evaluate ---
 split: val
@@ -90,7 +91,7 @@ seed: 42
 # eval_cell.py will write CTC-format results:
 #   <output_dir>/res/<seq>/man_track.txt  (lineage)
 #   <output_dir>/res/<seq>/mask<t>.tif    (label images, if masks=true)
-masks: false
+masks: true
 
 # --- unused / keep defaults ---
 aux_loss: true

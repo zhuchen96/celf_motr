@@ -9,7 +9,7 @@
 
 # --- paths ---
 mot_path: /srv/home/chen/Cell-TRACTR/data/deepcell/COCO
-output_dir: /srv/home/chen/cell_motr/self/outputs/cell_deepcell
+output_dir: /srv/home/chen/cell_motr/self/outputs/cell_deepcell_self
 pretrained: /srv/home/chen/self/ckpt/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth
 
 # --- dataset ---
@@ -52,7 +52,7 @@ dropout: 0.0
 #   lengths[1] until 25, lengths[2] until 40, then lengths[3].
 sample_mode: random_interval
 sample_interval: 1        # MUST be 1: division supervision requires t and t+1 consecutive in same clip
-sampler_lengths: [2, 4, 6, 8]
+sampler_lengths: [2, 3, 4, 4]
 sampler_steps: [10, 25, 40]
 
 # --- optimiser ---
@@ -62,7 +62,7 @@ lr_backbone_names: ["backbone.0"]
 lr_linear_proj_names: ["reference_points", "sampling_offsets"]
 lr_linear_proj_mult: 0.1
 weight_decay: 1.0e-4
-clip_max_norm: 0.5
+clip_max_norm: 0.1
 sgd: false
 
 # --- schedule ---
@@ -91,6 +91,11 @@ aux_loss: true
 div_loss_coef: 10.0
 # MLP affinity loss weight (division proposal affinity cross-entropy)
 div_affinity_loss_coef: 1.0
+
+# --- score consistency ---
+# Penalises MSE between a track's confidence score at t vs t-1.
+# Forces stable per-track scores and reduces dropout-then-reappear behaviour.
+score_consist_loss_coef: 0.5
 
 # --- division-clip oversampling ---
 # 30% of clips are drawn from the division pool so the model sees dividing
@@ -122,8 +127,11 @@ device: cuda
 seed: 42
 use_checkpoint: true     # gradient checkpointing: saves VRAM with 300+ queries
 
+# --- mask prediction ---
+masks: true
+mask_loss_coef: 2.0
+
 # --- unused / keep defaults ---
-masks: false
 memory_bank_type: ~
 memory_bank_score_thresh: 0.0
 memory_bank_len: 4

@@ -120,6 +120,9 @@ def track_sequence(model, img_dir: Path, frame_files: list,
         # (same logit gating _spawn_daughter2_tracks during inference).
         has_div_logit = (dt.has('pred_logits') and dt.pred_logits.shape[-1] >= 2)
 
+        has_masks = dt.has('pred_masks')
+        H_img, W_img = ori_size
+
         frame_tracks = []
         for idx, (tid, box) in enumerate(zip(dt.obj_idxes.tolist(), dt.boxes.tolist())):
             parent_id  = int(dt.parent_obj_id[idx]) if has_parent else -1
@@ -136,7 +139,14 @@ def track_sequence(model, img_dir: Path, frame_files: list,
                 div_boxes = d1 + d2
             else:
                 div_boxes = None
-            frame_tracks.append((int(tid), box, div_score, div_boxes, parent_id))
+            # Instance mask (optional): sigmoid of logits, resized to image size
+            pred_mask_np = None
+            if has_masks:
+                pm = dt.pred_masks[idx].sigmoid().cpu().numpy()
+                if pm.shape != (H_img, W_img):
+                    pm = cv2.resize(pm, (W_img, H_img), interpolation=cv2.INTER_LINEAR)
+                pred_mask_np = pm
+            frame_tracks.append((int(tid), box, div_score, div_boxes, parent_id, pred_mask_np))
         per_frame.append(frame_tracks)
 
     return per_frame
@@ -173,7 +183,8 @@ def close_gaps(per_frame: list, max_gap: int = 5,
     track_first = {}
     daughter_tids = set()
     for t, frame_tracks in enumerate(per_frame):
-        for tid, box, div_score, div_boxes, par in frame_tracks:
+        for entry in frame_tracks:
+            tid, box, div_score, div_boxes, par = entry[:5]
             if par >= 0:
                 daughter_tids.add(tid)
             if tid not in track_first:
@@ -215,10 +226,12 @@ def close_gaps(per_frame: list, max_gap: int = 5,
     for frame_tracks in per_frame:
         seen = set()
         new_frame = []
-        for tid, box, div_score, div_boxes, par in frame_tracks:
+        for entry in frame_tracks:
+            tid, box, div_score, div_boxes, par = entry[:5]
+            pred_mask_np = entry[5] if len(entry) > 5 else None
             root = find(tid)
             if root not in seen:
-                new_frame.append((root, box, div_score, div_boxes, par))
+                new_frame.append((root, box, div_score, div_boxes, par, pred_mask_np))
                 seen.add(root)
         new_per_frame.append(new_frame)
 
@@ -264,13 +277,21 @@ def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
         label_img = np.zeros((H, W), dtype=np.uint16)
         active_labels = set()
 
-        for tid, box, div_score, div_boxes, par_tid in frame_tracks:
+        for entry in frame_tracks:
+            tid, box, div_score, div_boxes, par_tid = entry[:5]
+            pred_mask = entry[5] if len(entry) > 5 else None
             label = int(tid) + 1
             active_labels.add(label)
             x1, y1, x2, y2 = box
             x1, y1 = max(0, int(round(x1))), max(0, int(round(y1)))
             x2, y2 = min(W, int(round(x2))), min(H, int(round(y2)))
-            if x2 > x1 and y2 > y1:
+            if pred_mask is not None and x2 > x1 and y2 > y1:
+                # Clip predicted mask to the tracker bbox to prevent large-blob
+                # artifacts from the mask head on unmatched (spurious) tracks.
+                clipped = np.zeros(pred_mask.shape, dtype=bool)
+                clipped[y1:y2, x1:x2] = pred_mask[y1:y2, x1:x2] > 0.5
+                label_img[clipped] = label
+            elif x2 > x1 and y2 > y1:
                 label_img[y1:y2, x1:x2] = label
 
             if label not in track_span:
@@ -453,6 +474,20 @@ def main(args):
             per_frame = close_gaps(per_frame,
                                    max_gap=args.gap_close_frames,
                                    max_dist_factor=args.gap_close_dist_factor)
+
+        # Drop tracks shorter than min_track_len frames (single-frame noise).
+        if getattr(args, 'min_track_len', 1) > 1:
+            min_len = args.min_track_len
+            track_len = {}
+            for frame_tracks in per_frame:
+                for entry in frame_tracks:
+                    tid = entry[0]
+                    track_len[tid] = track_len.get(tid, 0) + 1
+            keep = {tid for tid, n in track_len.items() if n >= min_len}
+            per_frame = [
+                [e for e in frame_tracks if e[0] in keep]
+                for frame_tracks in per_frame
+            ]
 
         out_dir = output_root / f'{seq_key}_RES'
         write_ctc_results(per_frame, img_dir, frame_files, out_dir,

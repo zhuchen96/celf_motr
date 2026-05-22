@@ -71,8 +71,40 @@ def extract_bboxes(mask: np.ndarray):
     return bboxes
 
 
+def load_gt_mask(gt_dir: Path, seq_key: str, t: int):
+    """Load GT TRA mask for frame t, or None if unavailable."""
+    path = gt_dir / f'{seq_key}_GT' / 'TRA' / f'man_track{t:03d}.tif'
+    if not path.exists():
+        return None
+    return cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+
+
+def is_spurious_in_frame(pred_label: int, pred_mask: np.ndarray,
+                          gt_mask, iou_thr: float = 0.3) -> bool:
+    """Return True if pred_label has no IoU >= iou_thr match in gt_mask."""
+    if gt_mask is None:
+        return False
+    if pred_mask.shape != gt_mask.shape:
+        gt_mask = cv2.resize(gt_mask, (pred_mask.shape[1], pred_mask.shape[0]),
+                             interpolation=cv2.INTER_NEAREST)
+    pred_px = pred_mask == pred_label
+    if not pred_px.any():
+        return False
+    for gl in np.unique(gt_mask[pred_px]):
+        if gl == 0:
+            continue
+        gt_px = gt_mask == gl
+        inter = int((pred_px & gt_px).sum())
+        union = int((pred_px | gt_px).sum())
+        if union > 0 and inter / union >= iou_thr:
+            return False
+    return True
+
+
 def render_sequence(seq_key, res_dir: Path, img_dir: Path, frame_files: list,
-                    fps: int, scale: int, out_path: Path, line_frames: int):
+                    fps: int, scale: int, out_path: Path, line_frames: int,
+                    gt_dir: Path = None, iou_thr: float = 0.3,
+                    mask_alpha: float = 0.45):
     res_seq_dir = res_dir / f'{seq_key}_RES'
     if not res_seq_dir.exists():
         print(f"  WARNING: {res_seq_dir} not found, skipping")
@@ -123,7 +155,33 @@ def render_sequence(seq_key, res_dir: Path, img_dir: Path, frame_files: list,
         else:
             mask = np.zeros((H, W), dtype=np.uint16)
 
+        gt_mask = load_gt_mask(gt_dir, seq_key, t) if gt_dir else None
+
         bboxes = extract_bboxes(mask)
+
+        # Pre-compute spurious status once (used for both mask fill and bbox drawing).
+        spurious_set = {
+            label for label in bboxes
+            if is_spurious_in_frame(label, mask, gt_mask, iou_thr)
+        }
+
+        # Colored mask fill: spurious=red, real=track palette color.
+        if mask_alpha > 0:
+            mask_up = cv2.resize(mask, (out_W, out_H), interpolation=cv2.INTER_NEAREST)
+            overlay = img_bgr.copy()
+            for label in np.unique(mask_up):
+                if label == 0:
+                    continue
+                px = mask_up == label
+                fill = (0, 0, 220) if label in spurious_set else track_color(label)
+                overlay[px] = fill
+            img_bgr = cv2.addWeighted(overlay, mask_alpha, img_bgr, 1.0 - mask_alpha, 0)
+
+        # GT cell outlines drawn on top of mask fill.
+        if gt_mask is not None:
+            gt_up = cv2.resize(gt_mask, (out_W, out_H), interpolation=cv2.INTER_NEAREST)
+            gt_edge = cv2.Canny((gt_up > 0).astype(np.uint8) * 255, 50, 150)
+            img_bgr[gt_edge > 0] = (0, 200, 0)
 
         # Scale bboxes to output resolution and build lookup for division lines.
         scaled: dict = {}
@@ -136,12 +194,17 @@ def render_sequence(seq_key, res_dir: Path, img_dir: Path, frame_files: list,
 
         # Draw track boxes and labels.
         for label, (sx1, sy1, sx2, sy2) in scaled.items():
-            color   = track_color(label)
-            mitotic = label in dividing_labels
-            border  = (0, 255, 255) if mitotic else color   # cyan = yellow in BGR
-            thick   = font_thick + 1 if mitotic else font_thick
+            spurious = label in spurious_set
+            if spurious:
+                border = (0, 0, 255)
+                color  = (0, 0, 255)
+            else:
+                color   = track_color(label)
+                mitotic = label in dividing_labels
+                border  = (0, 255, 255) if mitotic else color
+            thick = font_thick + 1 if (label in dividing_labels and not spurious) else font_thick
             cv2.rectangle(img_bgr, (sx1, sy1), (sx2, sy2), border, thick)
-            text = f'{label}{"  M" if mitotic else ""}'
+            text = f'{label}{"  M" if label in dividing_labels and not spurious else ""}'
             cv2.putText(img_bgr, text, (max(sx1, 0), max(sy1 - 2, 8)),
                         cv2_font, font_scale, color, font_thick, cv2.LINE_AA)
 
@@ -171,9 +234,9 @@ def render_sequence(seq_key, res_dir: Path, img_dir: Path, frame_files: list,
 
 def main():
     parser = argparse.ArgumentParser('Visualise CTC inference results')
-    parser.add_argument('--res_dir',   default="/srv/home/chen/cell_motr/self/outputs/cell_moma_eval",
+    parser.add_argument('--res_dir',   default="/srv/home/chen/cell_motr/self/outputs/cell_deepcell_self_eval",
                         help='eval_cell.py output_dir (contains *_RES/ subdirs)')
-    parser.add_argument('--mot_path',  default="/srv/home/chen/Cell-TRACTR/data/moma/COCO",
+    parser.add_argument('--mot_path',  default="/srv/home/chen/Cell-TRACTR/data/deepcell/COCO",
                         help='COCO dataset root (same as eval_cell.py --mot_path)')
     parser.add_argument('--split',     default='val', choices=['train', 'val'])
     parser.add_argument('--video_dir', default=None,
@@ -183,6 +246,14 @@ def main():
                         help='Integer upscale factor for small images')
     parser.add_argument('--line_frames', type=int, default=8,
                         help='Number of frames to draw the sibling division line')
+    parser.add_argument('--gt_dir',      default=None,
+                        help='CTC GT root (e.g. .../CTC/val). '
+                             'When set, spurious predicted tracks are drawn in RED '
+                             'and GT cell outlines are shown in dark green.')
+    parser.add_argument('--iou_thr',     type=float, default=0.3,
+                        help='IoU threshold to classify a prediction as matching GT')
+    parser.add_argument('--mask_alpha',  type=float, default=0.45,
+                        help='Opacity of colored mask fill (0=off, 1=fully opaque)')
     args = parser.parse_args()
 
     res_dir   = Path(args.res_dir)
@@ -191,6 +262,7 @@ def main():
     ann_file  = mot_root / 'annotations' / args.split / 'anno.json'
     video_dir = Path(args.video_dir) if args.video_dir else res_dir / 'videos'
     video_dir.mkdir(parents=True, exist_ok=True)
+    gt_dir    = Path(args.gt_dir) if args.gt_dir else None
 
     with open(ann_file) as f:
         data = json.load(f)
@@ -208,7 +280,9 @@ def main():
         out_path = video_dir / f'{seq_key}.avi'
         render_sequence(seq_key, res_dir, img_dir, fnames,
                         fps=args.fps, scale=args.scale,
-                        out_path=out_path, line_frames=args.line_frames)
+                        out_path=out_path, line_frames=args.line_frames,
+                        gt_dir=gt_dir, iou_thr=args.iou_thr,
+                        mask_alpha=args.mask_alpha)
         print(f"  seq {seq_key}: {len(fnames)} frames → {out_path}")
 
 
