@@ -173,7 +173,7 @@ def render_sequence(seq_key, res_dir: Path, img_dir: Path, frame_files: list,
                 if label == 0:
                     continue
                 px = mask_up == label
-                fill = (0, 0, 220) if label in spurious_set else track_color(label)
+                fill = (0, 140, 255) if label in spurious_set else track_color(label)  # orange for spurious
                 overlay[px] = fill
             img_bgr = cv2.addWeighted(overlay, mask_alpha, img_bgr, 1.0 - mask_alpha, 0)
 
@@ -196,8 +196,8 @@ def render_sequence(seq_key, res_dir: Path, img_dir: Path, frame_files: list,
         for label, (sx1, sy1, sx2, sy2) in scaled.items():
             spurious = label in spurious_set
             if spurious:
-                border = (0, 0, 255)
-                color  = (0, 0, 255)
+                border = (0, 140, 255)  # orange for spurious
+                color  = (0, 140, 255)
             else:
                 color   = track_color(label)
                 mitotic = label in dividing_labels
@@ -234,9 +234,9 @@ def render_sequence(seq_key, res_dir: Path, img_dir: Path, frame_files: list,
 
 def main():
     parser = argparse.ArgumentParser('Visualise CTC inference results')
-    parser.add_argument('--res_dir',   default="/srv/home/chen/cell_motr/self/outputs/cell_deepcell_self_eval",
+    parser.add_argument('--res_dir',   default="/srv/home/chen/cell_motr/self/outputs/cell_moma_eval",
                         help='eval_cell.py output_dir (contains *_RES/ subdirs)')
-    parser.add_argument('--mot_path',  default="/srv/home/chen/Cell-TRACTR/data/deepcell/COCO",
+    parser.add_argument('--mot_path',  default="/srv/home/chen/Cell-TRACTR/data/moma/COCO",
                         help='COCO dataset root (same as eval_cell.py --mot_path)')
     parser.add_argument('--split',     default='val', choices=['train', 'val'])
     parser.add_argument('--video_dir', default=None,

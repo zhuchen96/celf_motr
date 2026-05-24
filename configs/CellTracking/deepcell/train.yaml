@@ -84,11 +84,11 @@ aux_loss: true
 # man_track/ files are present for all 91 train sequences.
 # pos_weight=5 (hardcoded in loss) handles the ~2-5% positive rate within BCE.
 # div_loss_coef scales the whole division loss relative to tracking loss.
-# loss_div_class now uses reduction='mean' (not 'sum'), so the loss no longer scales
-# with K (number of matched tracks). The effective per-event gradient is:
-#   pos_weight × div_loss_coef / K × BCE ≈ 5 × 10 / 70 × BCE ≈ 0.71 × BCE
-# This is stable through curriculum switches (longer clips don't inflate the loss).
+# loss_div_class uses balanced negative sampling (5:1 neg:pos ratio) so the gradient
+# magnitude is independent of K (number of matched tracks). Dense scenes (K≈70) no
+# longer get 14× weaker gradient than sparse scenes (K≈5).
 div_loss_coef: 10.0
+div_pos_weight: 5.0          # pos_weight for BCE division loss; ~2-5% positive rate needs strong boost
 # MLP affinity loss weight (division proposal affinity cross-entropy)
 div_affinity_loss_coef: 1.0
 

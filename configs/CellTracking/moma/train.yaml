@@ -83,9 +83,11 @@ aux_loss: true
 
 # --- division prediction ---
 # moma: ~97% of tracks divide (avg track length ~6 frames → ~17% per-cell-frame
-# positive rate → pos_weight ≈ 5 matches deepcell, no change needed).
-# loss_div_class uses reduction='mean' so div_loss_coef doesn't scale with K.
+# positive rate). With balanced sampling (5:1 neg:pos) and 17% positive rate,
+# the sampled batch already has ~5 neg per pos naturally, so pos_weight only
+# needs a mild boost. Use 2.0 instead of deepcell's 5.0 to avoid over-weighting.
 div_loss_coef: 5.0
+div_pos_weight: 2.0
 # MLP affinity loss for parent-link training (needed for lineage reconstruction).
 div_affinity_loss_coef: 1.0
 

@@ -297,11 +297,13 @@ def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
             if label not in track_span:
                 track_span[label] = [t, t, box, div_score, div_boxes]
                 # Use model-provided parent ID if available
+                if par_tid >= 0:
+                    print(f'  [div-link] t={t} label={label} par_tid={par_tid} → parent={int(par_tid)+1}')
                 parent[label] = (int(par_tid) + 1) if par_tid >= 0 else 0
             else:
                 track_span[label][1] = t
                 track_span[label][2] = box
-                track_span[label][3] = div_score
+                track_span[label][3] = max(track_span[label][3], div_score)  # keep max
                 track_span[label][4] = div_boxes
 
         cv2.imwrite(str(out_dir / f'mask{t:03d}.tif'), label_img)
@@ -339,6 +341,15 @@ def write_ctc_results(per_frame: list, img_dir: Path, frame_files: list,
     n_div = sum(1 for p in parent.values() if p != 0)
     print(f'    division events: {n_div // 2} '
           f'({n_div} daughter tracks with parent links)')
+    # Diagnostic: distribution of max_div_score across all tracks
+    all_max_ds = [info[3] for info in track_span.values()]
+    if all_max_ds:
+        import numpy as _np
+        arr = _np.array(all_max_ds)
+        buckets = [0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]
+        counts = [int((arr >= lo).sum()) for lo in buckets]
+        print(f'    [div-diag] max_div_score distribution across {len(arr)} tracks: '
+              + ', '.join(f'>={lo:.1f}:{c}' for lo, c in zip(buckets, counts)))
     with open(out_dir / 'res_track.txt', 'w') as f:
         for label, (b, e, *_) in sorted(track_span.items()):
             f.write(f'{label} {b} {e} {parent.get(label, 0)}\n')

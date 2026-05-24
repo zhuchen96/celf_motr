@@ -35,28 +35,43 @@ from .segmentation import MHAttentionMap, dice_loss
 
 
 class DivisionProposalMLP(nn.Module):
-    """Scores (mother_hs, proposal_hs) pairs for division proposal affinity.
+    """Scores (mother_hs, proposal_hs, rel_pos) pairs for division proposal affinity.
 
     For each dividing mother query, computes a scalar logit for every detection
     proposal.  Trained with cross-entropy so the mother learns to attend to the
     proposal that best overlaps GT daughter-2, bridging training and inference
     (which picks the nearest proposal at division time).
+
+    rel_pos encodes the spatial relationship between the mother and each proposal
+    explicitly: (dx, dy, dist) normalised by the mother's box diagonal.  This
+    lets the MLP learn geometric constraints (daughters appear nearby, roughly
+    opposite each other) that are hard to read from hidden states alone —
+    especially in dense scenes where many proposals have similar appearance.
     """
     def __init__(self, d_model: int):
         super().__init__()
+        pos_hidden = max(16, d_model // 16)
+        self.pos_proj = nn.Linear(3, pos_hidden)
         self.net = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
+            nn.Linear(d_model * 2 + pos_hidden, d_model),
             nn.ReLU(),
             nn.Linear(d_model, 1),
         )
 
-    def forward(self, mother_hs: Tensor, proposal_hs: Tensor) -> Tensor:
-        """mother_hs: [K, d], proposal_hs: [N, d] → logits [K, N]"""
+    def forward(self, mother_hs: Tensor, proposal_hs: Tensor,
+                rel_pos: Tensor) -> Tensor:
+        """
+        mother_hs:   [K, d]
+        proposal_hs: [N, d]
+        rel_pos:     [K, N, 3]  (dx, dy, dist) normalised by mother diagonal
+        → logits:    [K, N]
+        """
         K, d = mother_hs.shape
         N = proposal_hs.shape[0]
         m = mother_hs.unsqueeze(1).expand(K, N, d)
         p = proposal_hs.unsqueeze(0).expand(K, N, d)
-        return self.net(torch.cat([m, p], dim=-1)).squeeze(-1)
+        pos_feat = self.pos_proj(rel_pos)              # [K, N, pos_hidden]
+        return self.net(torch.cat([m, p, pos_feat], dim=-1)).squeeze(-1)
 
 
 class SimpleMaskHead(nn.Module):
@@ -100,7 +115,8 @@ class ClipMatcher(SetCriterion):
                         losses,
                         div_proposal_mlp=None,
                         score_consist_loss_coef=0.0,
-                        mask_loss_coef=0.0):
+                        mask_loss_coef=0.0,
+                        div_pos_weight=5.0):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -121,6 +137,7 @@ class ClipMatcher(SetCriterion):
         self._current_frame_idx = 0
         self.score_consist_loss_coef = score_consist_loss_coef
         self.mask_loss_coef = mask_loss_coef
+        self.div_pos_weight = div_pos_weight
         # Store as a plain attribute (not an nn.Module child) so this criterion does
         # not double-register the MLP.  The MLP is owned by the MOTR model and is
         # included in model.parameters() / model.state_dict() from there.
@@ -457,12 +474,36 @@ class ClipMatcher(SetCriterion):
 
                 # Division classification loss: pred_logits[:, num_classes] is the
                 # primary division signal.  pos_weight handles ~2-5% positive rate.
+                #
+                # Balanced-negative sampling: keep ALL positives + at most 5× negatives.
+                # Previously reduction='mean' over all K matched tracks caused the
+                # per-event gradient to be 14× weaker in dense scenes (K=70) vs sparse
+                # scenes (K=5), so the model never learned division for dense sequences.
+                # With a fixed neg:pos ratio the gradient is density-independent.
                 if pred_logits_i.shape[-1] > self.num_classes:
                     pred_div_logit = pred_logits_i[src_idx, self.num_classes]
-                    pos_weight_cls = torch.tensor(5.0, device=pred_div_logit.device)
-                    loss_div_class = F.binary_cross_entropy_with_logits(
-                        pred_div_logit, flex_div_flags, pos_weight=pos_weight_cls,
-                        reduction='mean')
+                    pos_weight_cls = torch.tensor(self.div_pos_weight, device=pred_div_logit.device)
+                    pos_mask = flex_div_flags > 0.5
+                    n_pos_cls = int(pos_mask.sum().item())
+                    if n_pos_cls > 0:
+                        # Subsample negatives to at most 5 × n_pos for density-independent
+                        # gradient.  This closes the 14× gap between K=5 and K=70 scenes.
+                        neg_idx = (~pos_mask).nonzero(as_tuple=True)[0]
+                        n_neg_keep = min(len(neg_idx), 5 * n_pos_cls)
+                        if len(neg_idx) > n_neg_keep:
+                            perm = torch.randperm(len(neg_idx), device=neg_idx.device)
+                            neg_idx = neg_idx[perm[:n_neg_keep]]
+                        pos_idx = pos_mask.nonzero(as_tuple=True)[0]
+                        sample_idx = torch.cat([pos_idx, neg_idx])
+                        loss_div_class = F.binary_cross_entropy_with_logits(
+                            pred_div_logit[sample_idx], flex_div_flags[sample_idx],
+                            pos_weight=pos_weight_cls, reduction='mean')
+                    else:
+                        # No divisions in this frame — suppress false positives with
+                        # a small mean loss over all negatives.
+                        loss_div_class = F.binary_cross_entropy_with_logits(
+                            pred_div_logit, flex_div_flags, pos_weight=pos_weight_cls,
+                            reduction='mean')
                     self.losses_dict[
                         'frame_{}_loss_div_class'.format(self._current_frame_idx)
                     ] = loss_div_class
@@ -551,8 +592,21 @@ class ClipMatcher(SetCriterion):
                                 free_idx_tr = free_mask_tr.nonzero(as_tuple=True)[0]
 
                                 if len(free_idx_tr) >= 1:
-                                    p_hs_free   = p_hs_all[free_idx_tr]
-                                    logits_aff  = self.div_proposal_mlp(m_hs_all, p_hs_free)  # [K_aff, N_free]
+                                    p_hs_free        = p_hs_all[free_idx_tr]
+                                    free_prop_boxes_tr = prop_boxes_all[free_idx_tr]   # [N_free, 4]
+                                    m_boxes_aff = track_instances.pred_boxes[
+                                        mother_src[valid][aff_ok]].detach()            # [K_aff, 4]
+                                    m_diag_aff  = (m_boxes_aff[:, 2].pow(2) +
+                                                   m_boxes_aff[:, 3].pow(2)).sqrt().clamp(min=1e-4)
+                                    dx_tr  = (free_prop_boxes_tr[None, :, 0] -
+                                              m_boxes_aff[:, None, 0]) / m_diag_aff[:, None]
+                                    dy_tr  = (free_prop_boxes_tr[None, :, 1] -
+                                              m_boxes_aff[:, None, 1]) / m_diag_aff[:, None]
+                                    rel_pos_tr = torch.stack(
+                                        [dx_tr, dy_tr, (dx_tr.pow(2) + dy_tr.pow(2)).sqrt()],
+                                        dim=-1)                                        # [K_aff, N_free, 3]
+                                    logits_aff  = self.div_proposal_mlp(
+                                        m_hs_all, p_hs_free, rel_pos_tr)              # [K_aff, N_free]
                                     # Remap GT targets to free-proposal indices
                                     d1_free = (free_idx_tr.unsqueeze(0) ==
                                                best_idx_d1[aff_ok].unsqueeze(1)).int().argmax(dim=1)
@@ -940,7 +994,15 @@ class MOTR(nn.Module):
         # Division signal: class_embed channel 1 (pred_logits[:, num_classes]).
         # This is the same logit supervised by loss_div_class during training.
         div_scores = torch.sigmoid(track_instances.pred_logits[:, self.num_classes])
-        is_dividing = (div_scores >= self.div_score_thresh) & (track_instances.obj_idxes >= 0) & (track_instances.scores >= self.track_base.filter_score_thresh)
+        active_mask = track_instances.obj_idxes >= 0
+        is_dividing = (div_scores >= self.div_score_thresh) & active_mask & (track_instances.scores >= self.track_base.filter_score_thresh)
+
+        # Debug: print max div_score among active tracks to diagnose threshold issues.
+        if active_mask.any():
+            max_ds = div_scores[active_mask].max().item()
+            n_above = (div_scores[active_mask] >= self.div_score_thresh).sum().item()
+            if max_ds > 0.2 or n_above > 0:  # only print when non-trivial
+                print(f'  [div-debug] n_active={active_mask.sum().item()} max_div_score={max_ds:.3f} n_above_thresh({self.div_score_thresh:.2f})={n_above}')
 
         # One-frame cooldown: just-born daughters and freshly-divided mothers both
         # carry parent_obj_id >= 0, preventing immediate re-division.
@@ -998,8 +1060,12 @@ class MOTR(nn.Module):
             free_idx = free_mask.nonzero(as_tuple=True)[0]  # indices into proposal slice
 
             if len(free_idx) >= 1:
-                free_prop_hs = prop_hs[free_idx]
-                logits = _mlp(mother_hs, free_prop_hs)  # [K, N_free]
+                free_prop_hs    = prop_hs[free_idx]
+                free_prop_boxes = prop_boxes[free_idx]          # [N_free, 4] cxcywh
+                dx  = (free_prop_boxes[None, :, 0] - m_boxes[:, None, 0]) / m_diag[:, None]
+                dy  = (free_prop_boxes[None, :, 1] - m_boxes[:, None, 1]) / m_diag[:, None]
+                rel_pos_inf = torch.stack([dx, dy, (dx.pow(2) + dy.pow(2)).sqrt()], dim=-1)
+                logits = _mlp(mother_hs, free_prop_hs, rel_pos_inf)  # [K, N_free]
 
                 if len(free_idx) >= 2:
                     top2_result  = logits.topk(2, dim=1)
@@ -1603,16 +1669,41 @@ class MOTR(nn.Module):
             # At each frame, _generate_empty_tracks prepends num_queries + n_proposals
             # fresh slots (obj_idxes=-1). After update(), any fresh slot that scored
             # >= score_thresh gets a new ID. If that slot overlaps a carry-over track
-            # (IoU > 0.5), it is a duplicate — reset it to -1 so QIMv2 drops it.
+            # (IoU > 0.65), it is a duplicate — reset it to -1 so QIMv2 drops it.
+            #
+            # We raise the IoU gate from 0.5 to 0.65 so that daughters (whose bounding
+            # boxes partially overlap the mother's predicted box at IoU 0.3–0.6) are not
+            # suppressed.  Very-tight duplicates (IoU > 0.65) are still removed.
+            #
+            # Additionally, carry-over tracks whose division score is significantly above
+            # the per-frame median are excluded from being NMS suppressors.  When the
+            # spawning mechanism did not fire (div_score below div_score_thresh), the
+            # mother track is still alive and its pred_boxes may point at a daughter
+            # position; excluding it from NMS lets the daughter proposal survive.
             newly_detected = (~was_tracked) & (track_instances.obj_idxes >= 0)
             if newly_detected.any() and was_tracked.any():
+                # Build carry mask: exclude likely-dividing tracks (div_score outliers).
+                carry_mask = was_tracked.clone()
+                if (track_instances.has('pred_logits') and
+                        track_instances.pred_logits.shape[-1] > self.num_classes):
+                    div_s = torch.sigmoid(
+                        track_instances.pred_logits[:, self.num_classes])
+                    active_div = div_s[was_tracked]
+                    if len(active_div) >= 4:
+                        div_med = active_div.median()
+                        div_std = active_div.std()
+                        # Exclude tracks > median + 1.5·std (top ~7% in a normal dist).
+                        carry_mask = was_tracked & (div_s <= div_med + 1.5 * div_std)
+                        if not carry_mask.any():
+                            carry_mask = was_tracked  # safety fallback
+
                 new_boxes   = box_ops.box_cxcywh_to_xyxy(
                     track_instances.pred_boxes[newly_detected].clamp(0, 1))
                 carry_boxes = box_ops.box_cxcywh_to_xyxy(
-                    track_instances.pred_boxes[was_tracked].clamp(0, 1))
+                    track_instances.pred_boxes[carry_mask].clamp(0, 1))
                 iou_mat = pairwise_iou(Boxes(new_boxes), Boxes(carry_boxes))  # [Nnew, Ncarry]
                 max_iou = iou_mat.max(dim=1).values
-                suppress = max_iou > 0.5
+                suppress = max_iou > 0.65
                 if suppress.any():
                     new_idxs = newly_detected.nonzero(as_tuple=True)[0]
                     track_instances.obj_idxes[new_idxs[suppress]] = -1
@@ -2128,7 +2219,8 @@ def build(args):
     criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses,
                             div_proposal_mlp=div_proposal_mlp,
                             score_consist_loss_coef=score_consist_loss_coef,
-                            mask_loss_coef=mask_loss_coef)
+                            mask_loss_coef=mask_loss_coef,
+                            div_pos_weight=getattr(args, 'div_pos_weight', 5.0))
     criterion.to(device)
     postprocessors = {}
     model = MOTR(

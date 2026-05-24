@@ -47,7 +47,7 @@ score_threshold: 0.15
 update_score_threshold: 0.15
 proposal_threshold: 0.05
 miss_tolerance: 5
-div_score_thresh: 0.5         # pred_logits[:, 1].sigmoid() gate; 0.5 = natural BCE boundary (matches _FLEX_THRESH)
+div_score_thresh: 0.3         # pred_logits[:, 1].sigmoid() gate; lowered from 0.5 — model may output 0.3-0.4 for dividing cells
 
 # --- gap closing (post-processing) ---
 gap_close_frames: 5          # stitch tracks separated by up to this many frames
@@ -60,9 +60,10 @@ split: val
 reuse_encoder_cache: true
 
 # --- viz_cell.py settings ---
-# div_threshold: fallback for rendering only (not a model gate — divisions are now
-# triggered by pred_div_score >= score_threshold, same as normal cell detection)
-div_threshold: 0.5
+# div_threshold: fallback post-processing gate — if a track ends with max_div_score
+# >= div_threshold, search for daughter tracks in the next frame.
+# Lowered from 0.5 to match div_score_thresh so both mechanisms use same bar.
+div_threshold: 0.3
 max_div_dist_factor: 2.0
 fps: 8
 scale: 1   # deepcell images are already 584×600; no upscaling needed
