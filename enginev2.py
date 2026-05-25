@@ -169,3 +169,72 @@ def train_one_epoch_mot_self_proposal(model: torch.nn.Module,
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+@torch.no_grad()
+def eval_one_epoch_mot_self_proposal(model, criterion, criterion_detect,
+                                     data_loader, score_threshold, device,
+                                     lambda_detect=1.0, reuse_encoder_cache=False):
+    """Compute val losses without gradient updates.
+
+    Keeps model in train() mode so the criterion branch runs inside the model
+    forward (not the inference/spawning branch).  torch.no_grad() suppresses
+    gradient tape so no memory is wasted.
+    """
+    model.train()
+    criterion.train()
+    criterion_detect.train()
+
+    model_module = getattr(model, 'module', model)
+    total, total_detect, n = 0.0, 0.0, 0
+    sums = defaultdict(float)
+
+    for data_dict in data_loader:
+        data_dict = data_dict_to_cuda(data_dict, device)
+
+        if reuse_encoder_cache:
+            outputs_detector, proposals_detector, encoder_cache = \
+                model_module.forward_detect_self_light(data_dict, score_threshold=score_threshold)
+            targets = data_dict['gt_instances']
+            loss_dict_detect = criterion_detect.forward_detect(outputs_detector, targets)
+            weight_dict_detect = criterion_detect.weight_dict
+            for inst in data_dict['gt_instances']:
+                inst._fields.pop('area', None)
+            data_dict['proposals'] = proposals_detector
+            data_dict = data_dict_to_cuda(data_dict, device)
+            outputs = model_module.forward_with_encoder_cache(data_dict, encoder_cache)
+        else:
+            outputs_detector, proposals_detector = model_module.forward_detect_self(
+                data_dict, score_threshold=score_threshold)
+            targets = data_dict['gt_instances']
+            loss_dict_detect = criterion_detect.forward_detect(outputs_detector, targets)
+            weight_dict_detect = criterion_detect.weight_dict
+            for inst in data_dict['gt_instances']:
+                inst._fields.pop('area', None)
+            data_dict['proposals'] = proposals_detector
+            data_dict = data_dict_to_cuda(data_dict, device)
+            outputs = model_module(data_dict)
+
+        loss_dict = criterion(outputs, data_dict)
+        weight_dict = criterion.weight_dict
+
+        loss_dict_r = utils.reduce_dict(loss_dict)
+        loss_dict_det_r = utils.reduce_dict(loss_dict_detect)
+
+        scaled = {k: v * weight_dict[k] for k, v in loss_dict_r.items() if k in weight_dict}
+        scaled_det = {k: v * weight_dict_detect[k] * lambda_detect
+                      for k, v in loss_dict_det_r.items() if k in weight_dict_detect}
+
+        total       += sum(scaled.values()).item()
+        total_detect += sum(scaled_det.values()).item()
+        for k, v in scaled.items():
+            sums[k] += v.item()
+        n += 1
+
+    if n == 0:
+        return {}
+    out = {'loss_overall': (total + total_detect) / n,
+           'loss': total / n,
+           'loss_detect': total_detect / n}
+    out.update({k: v / n for k, v in sums.items()})
+    return out

@@ -41,8 +41,6 @@ dropout: 0.0
 # score_threshold gates which detected tracks are shown in the output.
 # update_score_threshold controls when RuntimeTrackerBase activates / kills IDs.
 # Both should be equal in practice; lower values improve recall at cost of more FP.
-# At epoch 12/50 the model is still learning — 0.15 trades some precision for recall.
-# Raise back toward 0.3–0.4 as training matures.
 score_threshold: 0.15
 update_score_threshold: 0.15
 proposal_threshold: 0.05
@@ -81,7 +79,7 @@ div_loss_coef: 10.0
 div_affinity_loss_coef: 1.0
 
 # --- score consistency (must match training to keep weight_dict consistent) ---
-score_consist_loss_coef: 2.0
+score_consist_loss_coef: 0.5
 
 # --- runtime ---
 batch_size: 1

@@ -24,7 +24,11 @@ contains  annotations/train/anno.json  and  train/img/*.tif.
 import argparse
 import csv
 import datetime
+import math
 import random
+import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -48,11 +52,85 @@ from util.tool import load_model, load_torch_checkpoint
 import util.misc as utils
 import datasets.samplers as samplers
 from datasets import build_dataset
-from enginev2 import train_one_epoch_mot_self_proposal
+from enginev2 import train_one_epoch_mot_self_proposal, eval_one_epoch_mot_self_proposal
 from models import build_model
 from models.deformable_detrv2_det import build as build_detect
 
 import copy
+
+
+def _run_val_inference(args, checkpoint_path: Path, epoch: int) -> dict:
+    """Run eval_cell → diag_coverage → eval_division on val split.
+
+    Returns a dict of float metrics (NaN on failure).
+    Saves full stdout to <output_dir>/val_infer/epoch_XXXX.txt.
+    """
+    script_dir   = Path(__file__).parent
+    eval_out_dir = Path(args.output_dir) / 'val_infer' / f'epoch_{epoch:04d}'
+    eval_out_dir.mkdir(parents=True, exist_ok=True)
+    log_path     = eval_out_dir.parent / f'epoch_{epoch:04d}.txt'
+    ctc_val_dir  = Path(args.mot_path).parent / 'CTC' / 'val'
+
+    nan = float('nan')
+    metrics = {
+        'val_full_cov_pct': nan, 'val_mean_cov_pct': nan,
+        'val_d1_detect_pct': nan, 'val_d2_detect_pct': nan,
+        'val_both_linked_pct': nan,
+    }
+
+    def _run(cmd):
+        return subprocess.run(
+            cmd, capture_output=True, text=True, cwd=str(script_dir))
+
+    stdout_all = ''
+
+    # 1. Inference
+    cmd_eval = [sys.executable, str(script_dir / 'eval_cell.py'),
+                '--config', args.infer_config,
+                '--resume', str(checkpoint_path),
+                '--output_dir', str(eval_out_dir),
+                '--split', 'val']
+    r = _run(cmd_eval)
+    stdout_all += r.stdout + r.stderr
+    if r.returncode != 0:
+        print(f'  [val-infer] eval_cell.py failed (epoch {epoch})')
+        log_path.write_text(stdout_all)
+        return metrics
+
+    # 2. Coverage
+    cmd_cov = [sys.executable, str(script_dir / 'diag_coverage.py'),
+               '--gt_dir', str(ctc_val_dir),
+               '--res_dir', str(eval_out_dir)]
+    r = _run(cmd_cov)
+    stdout_all += r.stdout + r.stderr
+
+    # 3. Division
+    cmd_div = [sys.executable, str(script_dir / 'eval_division.py'),
+               '--gt_dir', str(ctc_val_dir),
+               '--res_dir', str(eval_out_dir)]
+    r = _run(cmd_div)
+    stdout_all += r.stdout + r.stderr
+
+    log_path.write_text(stdout_all)
+
+    # Parse key numbers from combined output
+    def _pct(pattern):
+        m = re.search(pattern, stdout_all)
+        return float(m.group(1)) if m else nan
+
+    metrics['val_full_cov_pct']    = _pct(r'Fully covered.*?\(\s*([\d.]+)%\)')
+    metrics['val_mean_cov_pct']    = _pct(r'Mean\s+coverage per track\s*:\s*([\d.]+)')
+    metrics['val_d1_detect_pct']   = _pct(r'D1 detected\s*:.*?\(([\d.]+)%\)')
+    metrics['val_d2_detect_pct']   = _pct(r'D2 detected\s*:.*?\(([\d.]+)%\)')
+    metrics['val_both_linked_pct'] = _pct(r'Both linked\s*:.*?\(([\d.]+)%\)')
+
+    print(f'  [val-infer] epoch {epoch}: '
+          f'full_cov={metrics["val_full_cov_pct"]:.1f}% '
+          f'mean_cov={metrics["val_mean_cov_pct"]:.1f}% '
+          f'D1={metrics["val_d1_detect_pct"]:.1f}% '
+          f'D2={metrics["val_d2_detect_pct"]:.1f}% '
+          f'both_linked={metrics["val_both_linked_pct"]:.1f}%')
+    return metrics
 
 
 def get_args_parser():
@@ -206,6 +284,12 @@ def get_args_parser():
     parser.add_argument('--div_ratio', type=float, default=0.0,
                         help='Fraction of training clips containing a division event (0–1)')
 
+    # Periodic val inference
+    parser.add_argument('--eval_period', type=int, default=0,
+                        help='Run full val inference every N epochs (0 = disabled)')
+    parser.add_argument('--infer_config', type=str, default=None,
+                        help='Path to infer.yaml used for periodic val inference')
+
     return parser
 
 
@@ -245,6 +329,30 @@ def main(args):
         collate_fn=utils.mot_collate_fn,
         num_workers=args.num_workers,
         pin_memory=True)
+
+    # Val dataloader — short fixed clips (length 2), no augmentation, no curriculum.
+    # Gracefully disabled if annotations/val/anno.json is missing.
+    data_loader_val = None
+    try:
+        args_val = copy.copy(args)
+        args_val.sampler_lengths = [2]
+        args_val.sampler_steps   = None
+        args_val.random_drop     = 0.0
+        args_val.fp_ratio        = 0.0
+        args_val.div_ratio       = 0.0
+        dataset_val = build_dataset(image_set='val', args=args_val)
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        data_loader_val = DataLoader(
+            dataset_val,
+            batch_size=args.batch_size,
+            sampler=sampler_val,
+            collate_fn=utils.mot_collate_fn,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False)
+        print(f'Val dataloader: {len(dataset_val)} clips')
+    except (AssertionError, FileNotFoundError) as e:
+        print(f'[train] Val dataloader disabled: {e}')
 
     def match_name_keywords(n, name_keywords):
         return any(b in n for b in name_keywords)
@@ -325,7 +433,11 @@ def main(args):
         'loss_cls', 'loss_bbox', 'loss_giou',
         'loss_div_box', 'loss_div_class',
         'grad_norm',
+        'val_loss_total', 'val_loss_track', 'val_loss_cls', 'val_loss_div_class',
+        'val_full_cov_pct', 'val_mean_cov_pct',
+        'val_d1_detect_pct', 'val_d2_detect_pct', 'val_both_linked_pct',
     ]
+    best_val_div_class = float('inf')
     if utils.is_main_process():
         if _TB_AVAILABLE:
             writer = SummaryWriter(log_dir=str(output_dir / 'tb_logs'))
@@ -350,14 +462,38 @@ def main(args):
         lr_scheduler.step()
 
         # -------------------------------------------------------------- #
+        # Val loss (every epoch, skipped if no val dataloader)           #
+        # -------------------------------------------------------------- #
+        val_stats = {}
+        if data_loader_val is not None:
+            val_stats = eval_one_epoch_mot_self_proposal(
+                model, criterion, criterion_detect, data_loader_val,
+                args.score_threshold, device,
+                lambda_detect=args.lambda_detect,
+                reuse_encoder_cache=args.reuse_encoder_cache)
+
+        # -------------------------------------------------------------- #
+        # Periodic val inference (every eval_period epochs, main only)   #
+        # -------------------------------------------------------------- #
+        infer_metrics = {}
+        run_infer = (utils.is_main_process()
+                     and getattr(args, 'eval_period', 0) > 0
+                     and getattr(args, 'infer_config', None) is not None
+                     and (epoch + 1) % args.eval_period == 0)
+        if run_infer:
+            infer_metrics = _run_val_inference(
+                args, output_dir / 'checkpoint.pth', epoch)
+
+        # -------------------------------------------------------------- #
         # Log metrics (main process only)                                 #
         # -------------------------------------------------------------- #
         if utils.is_main_process():
             current_lr = optimizer.param_groups[0]['lr']
 
-            def _sum_keys(prefix):
-                return sum(v for k, v in train_stats.items() if prefix in k)
+            def _sum_keys(prefix, stats=train_stats):
+                return sum(v for k, v in stats.items() if prefix in k)
 
+            nan = float('nan')
             row = {
                 'epoch':          epoch,
                 'lr':             current_lr,
@@ -370,6 +506,15 @@ def main(args):
                 'loss_div_box':   _sum_keys('loss_div_box'),
                 'loss_div_class': _sum_keys('loss_div_class'),
                 'grad_norm':      train_stats.get('grad_norm', 0.0),
+                'val_loss_total':     val_stats.get('loss_overall', nan),
+                'val_loss_track':     val_stats.get('loss', nan),
+                'val_loss_cls':       _sum_keys('loss_ce', val_stats),
+                'val_loss_div_class': _sum_keys('loss_div_class', val_stats),
+                'val_full_cov_pct':    infer_metrics.get('val_full_cov_pct', nan),
+                'val_mean_cov_pct':    infer_metrics.get('val_mean_cov_pct', nan),
+                'val_d1_detect_pct':   infer_metrics.get('val_d1_detect_pct', nan),
+                'val_d2_detect_pct':   infer_metrics.get('val_d2_detect_pct', nan),
+                'val_both_linked_pct': infer_metrics.get('val_both_linked_pct', nan),
             }
 
             # TensorBoard
@@ -377,7 +522,9 @@ def main(args):
                 for k, v in row.items():
                     if k == 'epoch':
                         continue
-                    group = k.split('_')[0]   # 'loss', 'lr', 'grad'
+                    if math.isnan(v):
+                        continue
+                    group = 'val' if k.startswith('val') else k.split('_')[0]
                     writer.add_scalar(f'{group}/{k}', v, epoch)
 
             # CSV (append one row)
@@ -385,19 +532,30 @@ def main(args):
                 csv.writer(f).writerow([row[h] for h in _CSV_HEADER])
 
         if args.output_dir:
+            checkpoint_payload = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'epoch': epoch,
+                'args': args,
+            }
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             if ((epoch + 1) % args.lr_drop == 0
                     or (epoch + 1) % args.save_period == 0
                     or (epoch + 1) % 5 == 0):
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04d}.pth')
             for cp in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, cp)
+                utils.save_on_master(checkpoint_payload, cp)
+
+            # Save best checkpoint based on val_loss_div_class.
+            if val_stats and utils.is_main_process():
+                val_div = row['val_loss_div_class']
+                if not math.isnan(val_div) and val_div < best_val_div_class:
+                    best_val_div_class = val_div
+                    utils.save_on_master(checkpoint_payload,
+                                         output_dir / 'checkpoint_best.pth')
+                    print(f'  [val] New best val_loss_div_class={val_div:.4f} '
+                          f'→ saved checkpoint_best.pth')
 
         dataset_train.step_epoch()
 

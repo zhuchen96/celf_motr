@@ -54,7 +54,7 @@ dropout: 0.0
 sample_mode: random_interval
 sample_interval: 1
 sampler_lengths: [2, 3, 4]
-sampler_steps: [5, 10]
+sampler_steps: [10, 25]
 
 # --- optimiser ---
 lr: 2.0e-4
@@ -67,8 +67,8 @@ clip_max_norm: 0.1
 sgd: false
 
 # --- schedule ---
-epochs: 30
-lr_drop: 20
+epochs: 50
+lr_drop: 40
 save_period: 5
 
 # --- loss weights ---
@@ -107,6 +107,10 @@ birth_oversample: 0
 score_threshold: 0.05
 lambda_detect: 0.5
 query_denoise: 0.05
+
+# --- periodic val inference ---
+eval_period: 5
+infer_config: /srv/home/chen/cell_motr/self/configs/CellTracking/moma/infer.yaml
 
 # --- training utilities ---
 batch_size: 1
